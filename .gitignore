@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*service-account*.json
+*credentials*.json
+erudite-variety-489900-b4-ff1cd4309f66.json
