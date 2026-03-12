@@ -37,8 +37,10 @@ CONFIDENCE_OPTIONS = [
 
 SORT_MODE_LABELS = {
     "original": "Original sheet order",
-    "success_rate": "Sorted by success rate",
-    "quality_score": "Sorted by Quality Score [%]",
+    "success_rate": "Sorted by success rate \u2193",
+    "success_rate_asc": "Sorted by success rate \u2191",
+    "quality_score": "Sorted by Quality Score [%] \u2193",
+    "quality_score_asc": "Sorted by Quality Score [%] \u2191",
 }
 
 QUALITY_SCORE_COLUMN_CANDIDATES = ["Quality Score [%]", "Quality Score", "QualityScore", "Quality"]
@@ -184,18 +186,31 @@ def _raw_to_clean_df(raw_records: list[dict] | None) -> pd.DataFrame:
     return grouped
 
 
-def _apply_sort_mode(metrics: pd.DataFrame, sort_mode: str | None) -> pd.DataFrame:
+def _apply_sort_mode(
+    metrics: pd.DataFrame,
+    sort_mode: str | None,
+    pin_first: str | None = None,
+) -> pd.DataFrame:
+    """Sort *metrics* and optionally pin *pin_first* policy to the front."""
     mode = sort_mode or "original"
     if mode == "success_rate":
-        return metrics.sort_values(["success_rate", "source_order"], ascending=[False, True], kind="stable").reset_index(drop=True)
+        result = metrics.sort_values(["success_rate", "source_order"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    elif mode == "success_rate_asc":
+        result = metrics.sort_values(["success_rate", "source_order"], ascending=[True, True], kind="stable").reset_index(drop=True)
+    elif mode == "quality_score" and "quality_score_pct" in metrics.columns:
+        result = metrics.sort_values(["quality_score_pct", "source_order"], ascending=[False, True], na_position="last", kind="stable").reset_index(drop=True)
+    elif mode == "quality_score_asc" and "quality_score_pct" in metrics.columns:
+        result = metrics.sort_values(["quality_score_pct", "source_order"], ascending=[True, True], na_position="first", kind="stable").reset_index(drop=True)
+    elif "source_order" in metrics.columns:
+        result = metrics.sort_values("source_order", ascending=True, kind="stable").reset_index(drop=True)
+    else:
+        result = metrics.reset_index(drop=True)
 
-    if mode == "quality_score" and "quality_score_pct" in metrics.columns:
-        return metrics.sort_values(["quality_score_pct", "source_order"], ascending=[False, True], na_position="last", kind="stable").reset_index(drop=True)
+    if pin_first and pin_first in set(result["model_name"].astype(str)):
+        mask = result["model_name"].astype(str) == pin_first
+        result = pd.concat([result[mask], result[~mask]], ignore_index=True)
 
-    if "source_order" in metrics.columns:
-        return metrics.sort_values("source_order", ascending=True, kind="stable").reset_index(drop=True)
-
-    return metrics.reset_index(drop=True)
+    return result
 
 
 def _common_prefix_at_boundary(names: list[str]) -> str:
@@ -502,8 +517,10 @@ app.layout = html.Div(
                 html.Button("Select All", id="select-all-btn"),
                 html.Button("Deselect All", id="deselect-all-btn"),
                 html.Button("Original Order", id="sort-original-btn"),
-                html.Button("Sort by Success Rate", id="sort-success-btn"),
-                html.Button("Sort by Quality Score [%]", id="sort-quality-btn"),
+                html.Button("Sort by Success Rate \u2193", id="sort-success-btn"),
+                html.Button("Sort by Success Rate \u2191", id="sort-success-asc-btn"),
+                html.Button("Sort by Quality Score [%] \u2193", id="sort-quality-btn"),
+                html.Button("Sort by Quality Score [%] \u2191", id="sort-quality-asc-btn"),
             ],
         ),
         html.Div(id="sort-status", style={"marginTop": "6px", "fontSize": "13px"}),
@@ -528,6 +545,30 @@ app.layout = html.Div(
             style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
             style_data_conditional=[],
         ),
+        html.Hr(),
+        html.H4("All-vs-all compact letter display (CLD)"),
+        html.P(
+            "All selected policies compared pairwise (Holm-adjusted). "
+            "Policies sharing a letter are not significantly different.",
+            style={"fontSize": "13px", "color": "#666"},
+        ),
+        dash_table.DataTable(
+            id="allvsall-cld-table",
+            columns=[],
+            data=[],
+            page_size=20,
+            style_table={"overflowX": "auto"},
+            style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
+            style_data_conditional=[],
+        ),
+        dcc.Checklist(
+            id="show-allvsall-violin-toggle",
+            options=[{"label": "Show all-vs-all CLD violin", "value": "show"}],
+            value=["show"],
+            inline=True,
+            style={"marginTop": "8px"},
+        ),
+        html.Div(id="allvsall-violin-wrapper", children=[dcc.Graph(id="allvsall-violin-graph")]),
     ],
 )
 
@@ -536,21 +577,29 @@ app.layout = html.Div(
     Output("sort-mode-store", "data"),
     Input("sort-original-btn", "n_clicks"),
     Input("sort-success-btn", "n_clicks"),
+    Input("sort-success-asc-btn", "n_clicks"),
     Input("sort-quality-btn", "n_clicks"),
+    Input("sort-quality-asc-btn", "n_clicks"),
     State("sort-mode-store", "data"),
     prevent_initial_call=True,
 )
 def update_sort_mode(
     _sort_original_clicks: int,
     _sort_success_clicks: int,
+    _sort_success_asc_clicks: int,
     _sort_quality_clicks: int,
+    _sort_quality_asc_clicks: int,
     current_mode: str | None,
 ):
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
     if trigger == "sort-success-btn":
         return "success_rate"
+    if trigger == "sort-success-asc-btn":
+        return "success_rate_asc"
     if trigger == "sort-quality-btn":
         return "quality_score"
+    if trigger == "sort-quality-asc-btn":
+        return "quality_score_asc"
     if trigger == "sort-original-btn":
         return "original"
     return current_mode or "original"
@@ -735,6 +784,11 @@ def sync_policy_selectors(
     Output("cld-table", "data"),
     Output("cld-table", "columns"),
     Output("cld-table", "style_data_conditional"),
+    Output("allvsall-cld-table", "data"),
+    Output("allvsall-cld-table", "columns"),
+    Output("allvsall-cld-table", "style_data_conditional"),
+    Output("allvsall-violin-wrapper", "style"),
+    Output("allvsall-violin-graph", "figure"),
     Output("sort-status", "children"),
     Input("raw-table", "data"),
     Input("confidence-level", "value"),
@@ -743,6 +797,7 @@ def sync_policy_selectors(
     Input("policy-checklist", "value"),
     Input("show-final-violin-toggle", "value"),
     Input("sort-mode-store", "data"),
+    Input("show-allvsall-violin-toggle", "value"),
 )
 def update_analysis(
     rows: list[dict] | None,
@@ -752,10 +807,13 @@ def update_analysis(
     selected_policies: list[str] | None,
     show_final_violin_toggle: list[str] | None,
     sort_mode: str | None,
+    show_allvsall_violin_toggle: list[str] | None,
 ):
     clean_df = _raw_to_clean_df(rows)
     show_final_violin = "show" in (show_final_violin_toggle or [])
+    show_allvsall_violin = "show" in (show_allvsall_violin_toggle or [])
     final_violin_style = {"display": "block"} if show_final_violin else {"display": "none"}
+    allvsall_violin_style = {"display": "block"} if show_allvsall_violin else {"display": "none"}
 
     if clean_df.empty:
         return (
@@ -773,6 +831,11 @@ def update_analysis(
             [],
             [],
             [],
+            [],
+            [],
+            [],
+            allvsall_violin_style,
+            _empty_figure("No policy data"),
             f"Order mode: {SORT_MODE_LABELS.get(sort_mode or 'original', 'Original sheet order')}",
         )
 
@@ -796,11 +859,16 @@ def update_analysis(
             [],
             [],
             [],
+            [],
+            [],
+            [],
+            allvsall_violin_style,
+            _empty_figure("No concluded policies selected"),
             f"Order mode: {SORT_MODE_LABELS.get(sort_mode or 'original', 'Original sheet order')}",
         )
 
     metrics = prepare_policy_metrics(analysis_df, confidence_level)
-    metrics = _apply_sort_mode(metrics, sort_mode)
+    metrics = _apply_sort_mode(metrics, sort_mode, pin_first=policy_a)
     all_names = metrics["model_name"].astype(str).tolist()
     display_map, prefix = _make_display_names(all_names)
     _prefix_sub = f"<br><sup>common prefix: {prefix}</sup>" if prefix else ""
@@ -1388,6 +1456,68 @@ def update_analysis(
                     {"if": {"row_index": idx}, "backgroundColor": "#fff8e1"}
                 )
 
+    # All-vs-all CLD
+    allvsall_data: list[dict] = []
+    allvsall_columns: list[dict] = []
+    allvsall_styles: list[dict] = []
+    allvsall_violin_fig = _empty_figure("Select at least 2 policies for all-vs-all violin")
+    if not plot_df.empty and len(plot_df) >= 2:
+        cld_letters, _cld_tests = compact_letter_display(plot_df, alpha=alpha)
+        # Build the table: one row per policy with SR, Quality, CLD group
+        _ava_rows: list[dict] = []
+        for _, _row in plot_df.iterrows():
+            _name = str(_row["model_name"])
+            _sr = float(_row["successes"]) / float(_row["trials"]) * 100 if float(_row["trials"]) > 0 else 0
+            _entry: dict = {
+                "policy": display_map.get(_name, _name),
+                "success_rate_pct": round(_sr, 2),
+                "sr_group": cld_letters.get(_name, ""),
+            }
+            if "quality_score_pct" in _row.index and pd.notna(_row.get("quality_score_pct")):
+                _entry["quality_pct"] = round(float(_row["quality_score_pct"]), 2)
+            else:
+                _entry["quality_pct"] = None
+            _ava_rows.append(_entry)
+
+        allvsall_data = _ava_rows
+        _ava_cols = ["policy", "success_rate_pct", "sr_group"]
+        _has_quality_in_ava = any(r.get("quality_pct") is not None for r in _ava_rows)
+        if _has_quality_in_ava:
+            _ava_cols.append("quality_pct")
+        _AVA_COL_NAMES = {
+            "policy": "Policy",
+            "success_rate_pct": "SR (%)",
+            "sr_group": "SR Group",
+            "quality_pct": "Quality (%)",
+        }
+        allvsall_columns = [{"name": _AVA_COL_NAMES.get(c, c), "id": c} for c in _ava_cols]
+
+        # Determine distinct groups and count them
+        _unique_groups = sorted({v for v in cld_letters.values() if v})
+        _n_groups = len(_unique_groups)
+        # Color-code rows by group membership
+        _group_colors = ["#e3f2fd", "#fce4ec", "#e8f5e9", "#fff3e0", "#f3e5f5", "#e0f7fa"]
+        if _n_groups > 1:
+            _group_color_map = {g: _group_colors[i % len(_group_colors)] for i, g in enumerate(_unique_groups)}
+            for idx, rec in enumerate(allvsall_data):
+                grp = rec.get("sr_group", "")
+                if grp in _group_color_map:
+                    allvsall_styles.append(
+                        {"if": {"row_index": idx}, "backgroundColor": _group_color_map[grp]}
+                    )
+
+        # All-vs-all violin
+        if show_allvsall_violin:
+            allvsall_violin_fig = _build_posterior_violin(
+                plot_df,
+                cld_letters,
+                policy_colors,
+                f"All-vs-all posterior uncertainty (Bayesian CLD){_prefix_sub}",
+                display_names=display_map,
+            )
+        else:
+            allvsall_violin_fig = go.Figure()
+
     return (
         summary.to_dict("records"),
         summary_columns,
@@ -1403,6 +1533,11 @@ def update_analysis(
         cld_data,
         cld_columns,
         cld_row_styles,
+        allvsall_data,
+        allvsall_columns,
+        allvsall_styles,
+        allvsall_violin_style,
+        allvsall_violin_fig,
         sort_status,
     )
 
