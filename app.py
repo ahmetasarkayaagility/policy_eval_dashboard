@@ -41,6 +41,8 @@ SORT_MODE_LABELS = {
     "success_rate_asc": "Sorted by success rate \u2191",
     "quality_score": "Sorted by Quality Score [%] \u2193",
     "quality_score_asc": "Sorted by Quality Score [%] \u2191",
+    "dropin_ratio": "Sorted by Attempt Drop-in [%] \u2193",
+    "dropin_ratio_asc": "Sorted by Attempt Drop-in [%] \u2191",
 }
 
 QUALITY_SCORE_COLUMN_CANDIDATES = ["Quality Score [%]", "Quality Score", "QualityScore", "Quality"]
@@ -51,6 +53,16 @@ QUALITY_SCORE_STD_COLUMN_CANDIDATES = [
     "Quality STD",
 ]
 SUCCESS_RATE_INPUT_CANDIDATES = ["Success Rate [%]", "Success Rate", "Success_Rate", "Rate", "Accuracy"]
+DROPIN_RATIO_COLUMN_CANDIDATES = [
+    "Attempt to drop in Ratio [%]",
+    "Attempt to drop in Ratio",
+    "Attempt Drop-in Ratio [%]",
+    "Attempt Drop-in Ratio",
+    "Drop-in Ratio [%]",
+    "Drop-in Ratio",
+    "DropIn Ratio",
+    "Drop in Ratio",
+]
 POLICY_COLOR_PALETTE = [
     "#1f77b4",
     "#ff7f0e",
@@ -128,6 +140,8 @@ def _raw_to_clean_df(raw_records: list[dict] | None) -> pd.DataFrame:
                 "trials",
                 "source_order",
                 "quality_score_pct",
+                "dropin_ratio_pct",
+                "dropin_count",
                 "has_success_rate_input",
             ]
         )
@@ -162,6 +176,19 @@ def _raw_to_clean_df(raw_records: list[dict] | None) -> pd.DataFrame:
         df["quality_score_pct"] = pd.NA
         df["quality_score_std_pct"] = pd.NA
 
+    dropin_col = _find_column(df, DROPIN_RATIO_COLUMN_CANDIDATES)
+    if dropin_col is not None:
+        dropin_raw = _percent_like_to_numeric(df[dropin_col])
+        unit_mask_di = dropin_raw.notna() & (dropin_raw >= 0) & (dropin_raw <= 1)
+        df["dropin_ratio_pct"] = dropin_raw.where(~unit_mask_di, dropin_raw * 100.0)
+        # Back-compute dropin count from percentage and trials for Wilson CI
+        df["dropin_count"] = (df["dropin_ratio_pct"] / 100.0 * df["trials"]).round().fillna(0).astype(int)
+        df["dropin_count"] = df["dropin_count"].clip(lower=0)
+        df["dropin_count"] = df[["dropin_count", "trials"]].min(axis=1)
+    else:
+        df["dropin_ratio_pct"] = pd.NA
+        df["dropin_count"] = pd.NA
+
     success_rate_input_col = _find_column(df, SUCCESS_RATE_INPUT_CANDIDATES)
     if success_rate_input_col is not None:
         df["has_success_rate_input"] = _percent_like_to_numeric(df[success_rate_input_col]).notna()
@@ -177,6 +204,8 @@ def _raw_to_clean_df(raw_records: list[dict] | None) -> pd.DataFrame:
                 "source_order": "min",
                 "quality_score_pct": "mean",
                 "quality_score_std_pct": "first",
+                "dropin_ratio_pct": "mean",
+                "dropin_count": "sum",
                 "has_success_rate_input": "any",
             }
         )
@@ -201,6 +230,10 @@ def _apply_sort_mode(
         result = metrics.sort_values(["quality_score_pct", "source_order"], ascending=[False, True], na_position="last", kind="stable").reset_index(drop=True)
     elif mode == "quality_score_asc" and "quality_score_pct" in metrics.columns:
         result = metrics.sort_values(["quality_score_pct", "source_order"], ascending=[True, True], na_position="first", kind="stable").reset_index(drop=True)
+    elif mode == "dropin_ratio" and "dropin_ratio_pct" in metrics.columns:
+        result = metrics.sort_values(["dropin_ratio_pct", "source_order"], ascending=[False, True], na_position="last", kind="stable").reset_index(drop=True)
+    elif mode == "dropin_ratio_asc" and "dropin_ratio_pct" in metrics.columns:
+        result = metrics.sort_values(["dropin_ratio_pct", "source_order"], ascending=[True, True], na_position="first", kind="stable").reset_index(drop=True)
     elif "source_order" in metrics.columns:
         result = metrics.sort_values("source_order", ascending=True, kind="stable").reset_index(drop=True)
     else:
@@ -508,6 +541,7 @@ app.layout = html.Div(
         html.Div(id="ab-output", style={"marginTop": "10px"}),
         dcc.Graph(id="ab-comparison-graph"),
         dcc.Graph(id="ab-quality-graph"),
+        dcc.Graph(id="ab-dropin-graph"),
         dcc.Graph(id="ab-violin-graph"),
         html.Hr(),
         html.H4("Multi-policy comparison + compact letter display"),
@@ -521,6 +555,8 @@ app.layout = html.Div(
                 html.Button("Sort by Success Rate \u2191", id="sort-success-asc-btn"),
                 html.Button("Sort by Quality Score [%] \u2193", id="sort-quality-btn"),
                 html.Button("Sort by Quality Score [%] \u2191", id="sort-quality-asc-btn"),
+                html.Button("Sort by Attempt Drop-in \u2193", id="sort-dropin-btn"),
+                html.Button("Sort by Attempt Drop-in \u2191", id="sort-dropin-asc-btn"),
             ],
         ),
         html.Div(id="sort-status", style={"marginTop": "6px", "fontSize": "13px"}),
@@ -534,6 +570,7 @@ app.layout = html.Div(
         ),
         dcc.Graph(id="performance-graph"),
         dcc.Graph(id="quality-score-graph"),
+        dcc.Graph(id="dropin-ratio-graph"),
         dcc.Graph(id="sr-vs-quality-graph"),
         html.Div(id="final-violin-wrapper", children=[dcc.Graph(id="cld-violin-graph")]),
         dash_table.DataTable(
@@ -580,6 +617,8 @@ app.layout = html.Div(
     Input("sort-success-asc-btn", "n_clicks"),
     Input("sort-quality-btn", "n_clicks"),
     Input("sort-quality-asc-btn", "n_clicks"),
+    Input("sort-dropin-btn", "n_clicks"),
+    Input("sort-dropin-asc-btn", "n_clicks"),
     State("sort-mode-store", "data"),
     prevent_initial_call=True,
 )
@@ -589,6 +628,8 @@ def update_sort_mode(
     _sort_success_asc_clicks: int,
     _sort_quality_clicks: int,
     _sort_quality_asc_clicks: int,
+    _sort_dropin_clicks: int,
+    _sort_dropin_asc_clicks: int,
     current_mode: str | None,
 ):
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
@@ -600,6 +641,10 @@ def update_sort_mode(
         return "quality_score"
     if trigger == "sort-quality-asc-btn":
         return "quality_score_asc"
+    if trigger == "sort-dropin-btn":
+        return "dropin_ratio"
+    if trigger == "sort-dropin-asc-btn":
+        return "dropin_ratio_asc"
     if trigger == "sort-original-btn":
         return "original"
     return current_mode or "original"
@@ -775,9 +820,11 @@ def sync_policy_selectors(
     Output("ab-output", "children"),
     Output("ab-comparison-graph", "figure"),
     Output("ab-quality-graph", "figure"),
+    Output("ab-dropin-graph", "figure"),
     Output("ab-violin-graph", "figure"),
     Output("performance-graph", "figure"),
     Output("quality-score-graph", "figure"),
+    Output("dropin-ratio-graph", "figure"),
     Output("sr-vs-quality-graph", "figure"),
     Output("final-violin-wrapper", "style"),
     Output("cld-violin-graph", "figure"),
@@ -822,9 +869,11 @@ def update_analysis(
             "Add policy rows to start analysis.",
             _empty_figure("Pick two policies for A/B plot"),
             _empty_figure("No quality score data for selected A/B policies"),
+            _empty_figure("No drop-in ratio data for selected A/B policies"),
             _empty_figure("Pick two policies for posterior uncertainty view"),
             _empty_figure("No policy data"),
             _empty_figure("No quality score data for selected policies"),
+            _empty_figure("No drop-in ratio data for selected policies"),
             _empty_figure("No quality data for scatter view"),
             final_violin_style,
             _empty_figure("No policy data"),
@@ -850,9 +899,11 @@ def update_analysis(
             "No concluded policies available: success rate is empty for all rows.",
             _empty_figure("Pick two concluded policies for A/B plot"),
             _empty_figure("No quality score data for selected A/B policies"),
+            _empty_figure("No drop-in ratio data for selected A/B policies"),
             _empty_figure("Pick two concluded policies for posterior uncertainty view"),
             _empty_figure("No concluded policies selected"),
             _empty_figure("No quality score data for selected policies"),
+            _empty_figure("No drop-in ratio data for selected policies"),
             _empty_figure("No quality data for scatter view"),
             final_violin_style,
             _empty_figure("No concluded policies selected"),
@@ -877,6 +928,10 @@ def update_analysis(
     has_quality_std = (
         "quality_score_std_pct" in metrics.columns
         and pd.to_numeric(metrics.get("quality_score_std_pct"), errors="coerce").notna().any()
+    )
+    has_dropin = (
+        "dropin_ratio_pct" in metrics.columns
+        and pd.to_numeric(metrics.get("dropin_ratio_pct"), errors="coerce").notna().any()
     )
 
     summary = metrics.copy()
@@ -913,10 +968,24 @@ def update_analysis(
         summary_columns.append({"name": "quality_std_%", "id": "quality_score_std_pct"})
         summary_columns.append({"name": "quality_ci_low_%", "id": "quality_ci_low"})
         summary_columns.append({"name": "quality_ci_high_%", "id": "quality_ci_high"})
+    if has_dropin:
+        summary["dropin_ratio_pct"] = pd.to_numeric(metrics["dropin_ratio_pct"], errors="coerce").round(2)
+        _di_count = pd.to_numeric(metrics.get("dropin_count"), errors="coerce").fillna(0).astype(int)
+        _di_trials = metrics["trials"].astype(int)
+        _di_ci = pd.DataFrame(
+            [wilson_interval(int(dc), int(tr), confidence_level) for dc, tr in zip(_di_count, _di_trials)],
+            columns=["dropin_wilson_low", "dropin_wilson_high"],
+        )
+        summary["dropin_wilson_low"] = (_di_ci["dropin_wilson_low"] * 100).round(2)
+        summary["dropin_wilson_high"] = (_di_ci["dropin_wilson_high"] * 100).round(2)
+        summary_columns.append({"name": "dropin_%", "id": "dropin_ratio_pct"})
+        summary_columns.append({"name": "dropin_ci_low_%", "id": "dropin_wilson_low"})
+        summary_columns.append({"name": "dropin_ci_high_%", "id": "dropin_wilson_high"})
 
     ab_output = "Pick two policies to compare."
     ab_fig = _empty_figure("Pick two policies for A/B plot")
     ab_quality_fig = _empty_figure("No quality score data for selected A/B policies")
+    ab_dropin_fig = _empty_figure("No drop-in ratio data for selected A/B policies")
     ab_violin_fig = _empty_figure("Pick two policies for A/B posterior view")
 
     if policy_a and policy_b and policy_a in set(metrics["model_name"]) and policy_b in set(metrics["model_name"]):
@@ -1007,6 +1076,11 @@ def update_analysis(
             title=f"A/B policy comparison with {int(confidence_level * 100)}% Wilson CIs{_prefix_sub}",
             yaxis_range=[0, min(105, max(5, math.ceil((ab_df["wilson_high"].max() * 100) / 5) * 5 + 5))],
         )
+
+        q_better = q_worse = False
+        di_better = di_worse = False
+        quality_card = None
+        dropin_card = None
 
         if "quality_score_pct" in ab_df.columns and pd.to_numeric(ab_df["quality_score_pct"], errors="coerce").notna().any():
             ab_quality_values = pd.to_numeric(ab_df["quality_score_pct"], errors="coerce")
@@ -1106,46 +1180,142 @@ def update_analysis(
                         },
                     )
 
-                    # Combined verdict
-                    if sr_better and q_better:
-                        _ov = "Both metrics favor B over A."
-                        _oc = "#2e7d32"
-                    elif sr_worse and q_worse:
-                        _ov = "Both metrics favor A over B."
-                        _oc = "#c62828"
-                    elif sr_better and q_worse:
-                        _ov = "Trade-off: B has higher success rate but lower quality."
-                        _oc = "#e65100"
-                    elif sr_worse and q_better:
-                        _ov = "Trade-off: B has lower success rate but higher quality."
-                        _oc = "#e65100"
-                    elif sr_better:
-                        _ov = "B has higher success rate; quality is inconclusive."
-                        _oc = "#2e7d32"
-                    elif sr_worse:
-                        _ov = "B has lower success rate; quality is inconclusive."
-                        _oc = "#c62828"
-                    elif q_better:
-                        _ov = "Success rate is inconclusive; B has higher quality."
-                        _oc = "#2e7d32"
-                    elif q_worse:
-                        _ov = "Success rate is inconclusive; B has lower quality."
-                        _oc = "#c62828"
-                    else:
-                        _ov = "No significant difference on either metric."
-                        _oc = "#9e9e9e"
+        # ── Attempt drop-in ratio A/B ──────────────────────────────────
+        if "dropin_ratio_pct" in ab_df.columns and pd.to_numeric(ab_df["dropin_ratio_pct"], errors="coerce").notna().any():
+            ab_di_values = pd.to_numeric(ab_df["dropin_ratio_pct"], errors="coerce")
+            ab_dropin_fig = go.Figure()
+            _di_ci_ab = ab_df.apply(
+                lambda row: wilson_interval(
+                    int(row["dropin_count"]) if pd.notna(row.get("dropin_count")) else 0,
+                    int(row["trials"]),
+                    confidence_level,
+                ),
+                axis=1,
+                result_type="expand",
+            )
+            _di_lo_ab, _di_hi_ab = _di_ci_ab[0] * 100, _di_ci_ab[1] * 100
+            ab_dropin_fig.add_bar(
+                x=[display_map.get(n, n) for n in ab_df["model_name"]],
+                y=ab_di_values,
+                marker_color=[policy_colors.get(name, "#1f77b4") for name in ab_df["model_name"]],
+                error_y={
+                    "type": "data",
+                    "array": (_di_hi_ab - ab_di_values).clip(lower=0),
+                    "arrayminus": (ab_di_values - _di_lo_ab).clip(lower=0),
+                    "visible": True,
+                },
+                text=[f"{val:.1f}%" if pd.notna(val) else "NA" for val in ab_di_values],
+                textposition="outside",
+            )
+            _di_max_y_ab = max(
+                ab_di_values.max(skipna=True) or 0,
+                _di_hi_ab.max(skipna=True) or 0,
+            )
+            ab_dropin_fig.update_layout(
+                template="plotly_white",
+                yaxis_title="Attempt Drop-in Ratio (%)",
+                xaxis_title="Policy",
+                title=f"A/B attempt drop-in comparison with {int(confidence_level * 100)}% Wilson CIs{_prefix_sub}",
+                yaxis_range=[0, min(105, max(5, math.ceil(_di_max_y_ab / 5) * 5 + 5))],
+            )
 
-                    overall_card = html.Div(
-                        html.Div(_ov, style={"fontWeight": "bold", "color": _oc}),
-                        style={
-                            "background": "#f5f5f5",
-                            "border": "1px solid #bdbdbd",
-                            "borderRadius": "6px",
-                            "padding": "10px 16px",
-                            "marginTop": "10px",
-                        },
-                    )
-                    ab_output = html.Div([ab_output, quality_card, overall_card])
+            # Newcombe-Wilson CI for drop-in difference (lower is better)
+            _di_a = ab_df.loc[ab_df["model_name"] == policy_a].iloc[0]
+            _di_b = ab_df.loc[ab_df["model_name"] == policy_b].iloc[0]
+            _di_cnt_b = int(_di_b["dropin_count"]) if pd.notna(_di_b.get("dropin_count")) else 0
+            _di_cnt_a = int(_di_a["dropin_count"]) if pd.notna(_di_a.get("dropin_count")) else 0
+            _di_dlow, _di_dhigh = delta_ci_newcombe_wilson(
+                _di_cnt_a,
+                int(_di_a["trials"]),
+                _di_cnt_b,
+                int(_di_b["trials"]),
+                confidence_level,
+            )
+            _di_delta = (
+                (_di_cnt_b / int(_di_b["trials"])) - (_di_cnt_a / int(_di_a["trials"]))
+            )
+            # Lower is better: delta_high < 0 → B lower (good); delta_low > 0 → B higher (bad)
+            if _di_dhigh < 0:
+                _didec = "B has significantly lower drop-in ratio (better)."
+                _dicolor = "#2e7d32"
+                di_better = True
+            elif _di_dlow > 0:
+                _didec = "B has significantly higher drop-in ratio (worse)."
+                _dicolor = "#c62828"
+                di_worse = True
+            else:
+                _didec = "Inconclusive drop-in ratio difference."
+                _dicolor = "#9e9e9e"
+
+            dropin_card = html.Div(
+                [
+                    html.Div("Attempt Drop-in Ratio", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                    html.Div(
+                        f"\u0394 (B \u2212 A): {_di_delta * 100:.2f} pp, "
+                        f"{confidence_level * 100:.0f}% CI: [{_di_dlow * 100:.2f}, {_di_dhigh * 100:.2f}] pp"
+                    ),
+                    html.Div(_didec, style={"fontWeight": "bold", "marginTop": "4px", "color": _dicolor}),
+                ],
+                style={
+                    "background": "#fafafa",
+                    "border": "1px solid #e0e0e0",
+                    "borderRadius": "6px",
+                    "padding": "12px 16px",
+                    "marginTop": "10px",
+                },
+            )
+
+        # ── Combined verdict ───────────────────────────────────────────
+        _has_extra_verdict = quality_card is not None or dropin_card is not None
+        if _has_extra_verdict:
+            _b_wins: list[str] = []
+            _a_wins: list[str] = []
+
+            if sr_better:
+                _b_wins.append("success rate")
+            elif sr_worse:
+                _a_wins.append("success rate")
+
+            if q_better:
+                _b_wins.append("quality")
+            elif q_worse:
+                _a_wins.append("quality")
+
+            if di_better:
+                _b_wins.append("drop-in ratio")
+            elif di_worse:
+                _a_wins.append("drop-in ratio")
+
+            if _b_wins and not _a_wins:
+                _ov = f"B is significantly better on {', '.join(_b_wins)}."
+                _oc = "#2e7d32"
+            elif _a_wins and not _b_wins:
+                _ov = f"A is significantly better on {', '.join(_a_wins)}."
+                _oc = "#c62828"
+            elif _b_wins and _a_wins:
+                _ov = f"Trade-off: B is better on {', '.join(_b_wins)} but worse on {', '.join(_a_wins)}."
+                _oc = "#e65100"
+            else:
+                _ov = "No significant difference on any metric."
+                _oc = "#9e9e9e"
+
+            overall_card = html.Div(
+                html.Div(_ov, style={"fontWeight": "bold", "color": _oc}),
+                style={
+                    "background": "#f5f5f5",
+                    "border": "1px solid #bdbdbd",
+                    "borderRadius": "6px",
+                    "padding": "10px 16px",
+                    "marginTop": "10px",
+                },
+            )
+            _cards = [ab_output]
+            if quality_card is not None:
+                _cards.append(quality_card)
+            if dropin_card is not None:
+                _cards.append(dropin_card)
+            _cards.append(overall_card)
+            ab_output = html.Div(_cards)
 
         ab_pair_letters = base_vs_policy_letter_pairs(
             ab_df,
@@ -1275,6 +1445,7 @@ def update_analysis(
     if plot_df.empty:
         fig = _empty_figure("No selected policies to plot")
         quality_fig = _empty_figure("No quality score data for selected policies")
+        dropin_fig = _empty_figure("No drop-in ratio data for selected policies")
         sr_vs_q_fig = _empty_figure("No data for scatter view")
         if show_final_violin:
             violin_fig = _empty_figure("No selected policies for base-vs-policy violin")
@@ -1368,6 +1539,47 @@ def update_analysis(
             )
         else:
             quality_fig = _empty_figure("No quality score data for selected policies")
+
+        # ── Multi-policy drop-in ratio bar chart ──────────────────────
+        _mp_di_values = pd.to_numeric(plot_df.get("dropin_ratio_pct"), errors="coerce")
+        if _mp_di_values.notna().any():
+            dropin_fig = go.Figure()
+            _mp_di_ci = plot_df.apply(
+                lambda row: wilson_interval(
+                    int(row["dropin_count"]) if pd.notna(row.get("dropin_count")) else 0,
+                    int(row["trials"]),
+                    confidence_level,
+                ),
+                axis=1,
+                result_type="expand",
+            )
+            _mp_di_lo, _mp_di_hi = _mp_di_ci[0] * 100, _mp_di_ci[1] * 100
+            _mp_di_max = max(
+                _mp_di_values.max(skipna=True) or 0,
+                _mp_di_hi.max(skipna=True) or 0,
+            )
+            dropin_fig.add_bar(
+                x=[display_map.get(n, n) for n in plot_df["model_name"]],
+                y=_mp_di_values,
+                marker_color=[policy_colors.get(name, "#1f77b4") for name in plot_df["model_name"]],
+                error_y={
+                    "type": "data",
+                    "array": (_mp_di_hi - _mp_di_values).clip(lower=0),
+                    "arrayminus": (_mp_di_values - _mp_di_lo).clip(lower=0),
+                    "visible": True,
+                },
+                text=[f"{val:.1f}%" if pd.notna(val) else "NA" for val in _mp_di_values],
+                textposition="outside",
+            )
+            dropin_fig.update_layout(
+                template="plotly_white",
+                yaxis_title="Attempt Drop-in Ratio (%)",
+                xaxis_title="Policy",
+                title=f"Selected policies attempt drop-in with {int(confidence_level * 100)}% Wilson CIs{_prefix_sub}",
+                yaxis_range=[0, min(105, max(5, math.ceil(_mp_di_max / 5) * 5 + 5))],
+            )
+        else:
+            dropin_fig = _empty_figure("No drop-in ratio data for selected policies")
 
         # SR vs Quality scatter plot
         _q_vals_scatter = pd.to_numeric(plot_df.get("quality_score_pct"), errors="coerce")
@@ -1524,9 +1736,11 @@ def update_analysis(
         ab_output,
         ab_fig,
         ab_quality_fig,
+        ab_dropin_fig,
         ab_violin_fig,
         fig,
         quality_fig,
+        dropin_fig,
         sr_vs_q_fig,
         final_violin_style,
         violin_fig,
