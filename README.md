@@ -20,12 +20,14 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
   - Attempt drop-in ratio bar chart with Wilson CI error bars (when column is present; lower is better)
   - Posterior violin plot (Bayesian uncertainty)
 - Compare multiple policies with base-vs-policy pair letters.
+- **Testing Group tag filtering**: when a `Testing Group` column is present, use `Plot Tag + Base` to instantly select policies in the chosen tag plus the row tagged as `Base`/`Default`/`Baseline`/`Control`.
 - **Success Rate vs Quality Score scatter plot**: each policy is a point at (SR%, Quality%) with Wilson CI horizontal bars and quality CI vertical bars, enabling quick Pareto-style comparison.
 - Visualize posterior uncertainty using Bayesian violins in a final optional panel that compares base-vs-policy pairs (`base vs candidate`) with pair letters (`a-a` / `a-b`).
 - Plot selected policy success rates with Wilson CI error bars.
 - Plot selected policies' quality score (%) with t-distribution CI error bars (when STD is present) and quality pair-letter annotations.
 - Plot selected policies' attempt drop-in ratio (%) with Wilson CI error bars (when column is present).
 - Select all / deselect all policies in the plot.
+- Cleaner multi-policy controls: selection, tag filtering, and sorting controls are grouped in wrapped rows; policy checkboxes are shown in a compact scrollable panel.
 - Keep original sheet order by default, with optional sorting by success rate, `Quality Score [%]`, or `Attempt Drop-in Ratio [%]`.
 - Auto-deselect policies that have empty values in the source success-rate column.
 - Use consistent per-policy color mapping across all plots.
@@ -70,6 +72,8 @@ The loader is flexible about header placement:
 Under multi-policy comparison:
 
 - Use `Original Order`, `Sort by Success Rate`, `Sort by Quality Score [%]`, and `Sort by Attempt Drop-in` to control policy order.
+- If your sheet contains `Testing Group`, choose a tag and click `Plot Tag + Base` to plot that tag plus the base-tagged row.
+- Use `Clear Tag Filter` to go back to normal manual policy selection.
 - When your source sheet has a success-rate column and some rows are empty, those policies are auto-deselected from initial plotting.
 - Quality score values in `[0, 1]` are automatically converted to percentage points `[0, 100]` for display and sorting.
 
@@ -85,6 +89,7 @@ Optional columns:
 - `Quality Score [%]` — mean quality score per policy (values in `[0, 1]` are auto-scaled to `[0, 100]`).
 - `Quality Score STD [%]` — standard deviation of per-rollout quality scores. When present, the app computes t-distribution CIs for quality and runs Welch t-tests for A/B and multi-policy comparisons.
 - `Attempt to drop in Ratio [%]` — proportion of attempts where a drop-in occurred (binary Yes/No outcome). Lower is better. Values in `[0, 1]` are auto-scaled to `[0, 100]`. The count of drop-in events is back-computed as `round(ratio × trials)` and used for Wilson CIs and Newcombe-Wilson delta CIs.
+- `Testing Group` — tag/category for each policy row (e.g., `Training Hyperparams`, `Model Arch.`, `Data Mixture & Augmentation`). Values such as `Base`, `Default`, `Baseline`, or `Control` are treated as base rows for tag-group plotting.
 
 Accepted model-name aliases include: `Model Name`, `Model`, `Policy`, `Policy Name`.
 

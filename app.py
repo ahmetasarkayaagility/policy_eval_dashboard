@@ -63,6 +63,20 @@ DROPIN_RATIO_COLUMN_CANDIDATES = [
     "DropIn Ratio",
     "Drop in Ratio",
 ]
+TESTING_GROUP_COLUMN_CANDIDATES = [
+    "Testing Group",
+    "TestingGroup",
+    "Test Group",
+    "Experiment Group",
+    "Group",
+    "Tag",
+]
+BASE_GROUP_TAGS = {
+    "base",
+    "baseline",
+    "default",
+    "control",
+}
 POLICY_COLOR_PALETTE = [
     "#1f77b4",
     "#ff7f0e",
@@ -110,6 +124,22 @@ def _to_percent_points(series: pd.Series) -> pd.Series:
     return numeric.where(~unit_interval_mask, numeric * 100.0)
 
 
+def _normalize_group_tag(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value).strip().lower())
+
+
+def _is_base_group_tag(value: object) -> bool:
+    token = _normalize_group_tag(value)
+    return bool(token) and token in BASE_GROUP_TAGS
+
+
+def _first_non_null(series: pd.Series) -> object:
+    valid = series.dropna()
+    if valid.empty:
+        return pd.NA
+    return valid.iloc[0]
+
+
 def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     clean = hex_color.lstrip("#")
     if len(clean) != 6:
@@ -140,9 +170,12 @@ def _raw_to_clean_df(raw_records: list[dict] | None) -> pd.DataFrame:
                 "trials",
                 "source_order",
                 "quality_score_pct",
+                "quality_score_std_pct",
                 "dropin_ratio_pct",
                 "dropin_count",
                 "has_success_rate_input",
+                "testing_group",
+                "is_base_group",
             ]
         )
 
@@ -195,6 +228,14 @@ def _raw_to_clean_df(raw_records: list[dict] | None) -> pd.DataFrame:
     else:
         df["has_success_rate_input"] = True
 
+    testing_group_col = _find_column(df, TESTING_GROUP_COLUMN_CANDIDATES)
+    if testing_group_col is not None:
+        df["testing_group"] = df[testing_group_col].astype(str).str.strip()
+        df["testing_group"] = df["testing_group"].replace({"": pd.NA, "nan": pd.NA, "none": pd.NA})
+    else:
+        df["testing_group"] = pd.NA
+    df["is_base_group"] = df["testing_group"].map(_is_base_group_tag)
+
     grouped = (
         df.groupby("model_name", as_index=False)
         .agg(
@@ -207,6 +248,8 @@ def _raw_to_clean_df(raw_records: list[dict] | None) -> pd.DataFrame:
                 "dropin_ratio_pct": "mean",
                 "dropin_count": "sum",
                 "has_success_rate_input": "any",
+                "testing_group": _first_non_null,
+                "is_base_group": "any",
             }
         )
         .sort_values("source_order", kind="stable")
@@ -276,6 +319,15 @@ def _make_display_names(names: list[str]) -> tuple[dict[str, str], str]:
     if not prefix:
         return {n: n for n in names}, ""
     return {n: n[len(prefix):] for n in names}, prefix
+
+
+def _format_sort_status(sort_mode: str | None, prefix: str = "", active_group: str | None = None) -> str:
+    status = f"Order mode: {SORT_MODE_LABELS.get(sort_mode or 'original', 'Original sheet order')}"
+    if active_group:
+        status += f" | testing group: {active_group} + Base"
+    if prefix:
+        status += f" | common prefix: {prefix}"
+    return status
 
 
 def _empty_figure(message: str) -> go.Figure:
@@ -375,6 +427,7 @@ def _build_base_vs_pairs_violin(
     pair_letters_df: pd.DataFrame,
     policy_colors: dict[str, str],
     display_names: dict[str, str] | None = None,
+    title_suffix: str = "",
 ) -> go.Figure:
     if plot_df.empty:
         return _empty_figure("No selected policies for base-vs-policy violin")
@@ -446,7 +499,7 @@ def _build_base_vs_pairs_violin(
         violinmode="group",
         yaxis_title="Success Rate (%)",
         xaxis_title="Base-vs-policy pair",
-        title="Base-vs-policy posterior uncertainty with pair letters",
+        title=f"Base-vs-policy posterior uncertainty with pair letters{title_suffix}",
         yaxis_range=[0, 105],
         annotations=annotations,
     )
@@ -461,6 +514,7 @@ app.layout = html.Div(
     children=[
         dcc.Store(id="uploaded-file-store", data=None),
         dcc.Store(id="sort-mode-store", data="original"),
+        dcc.Store(id="active-testing-group-store", data=None),
         html.H2("Robot Policy Evaluation Dashboard"),
         html.P("Upload a local CSV/XLSX, edit/log rollout results, and compare policies with Wilson confidence intervals."),
         html.Hr(),
@@ -546,21 +600,70 @@ app.layout = html.Div(
         html.Hr(),
         html.H4("Multi-policy comparison + compact letter display"),
         html.Div(
-            style={"display": "flex", "gap": "10px", "alignItems": "center"},
+            style={"display": "grid", "gap": "8px"},
             children=[
-                html.Button("Select All", id="select-all-btn"),
-                html.Button("Deselect All", id="deselect-all-btn"),
-                html.Button("Original Order", id="sort-original-btn"),
-                html.Button("Sort by Success Rate \u2193", id="sort-success-btn"),
-                html.Button("Sort by Success Rate \u2191", id="sort-success-asc-btn"),
-                html.Button("Sort by Quality Score [%] \u2193", id="sort-quality-btn"),
-                html.Button("Sort by Quality Score [%] \u2191", id="sort-quality-asc-btn"),
-                html.Button("Sort by Attempt Drop-in \u2193", id="sort-dropin-btn"),
-                html.Button("Sort by Attempt Drop-in \u2191", id="sort-dropin-asc-btn"),
+                html.Div(
+                    style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
+                    children=[
+                        html.Button("Select All", id="select-all-btn"),
+                        html.Button("Deselect All", id="deselect-all-btn"),
+                        html.Div(
+                            style={"minWidth": "260px", "maxWidth": "360px"},
+                            children=[
+                                html.Label("Testing Group", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                dcc.Dropdown(
+                                    id="testing-group-dropdown",
+                                    options=[],
+                                    value=None,
+                                    clearable=True,
+                                    placeholder="Select a tag",
+                                    disabled=True,
+                                ),
+                            ],
+                        ),
+                        html.Button("Plot Tag + Base", id="apply-testing-group-btn"),
+                        html.Button("Clear Tag Filter", id="clear-testing-group-btn"),
+                    ],
+                ),
+                html.Div(
+                    style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
+                    children=[
+                        html.Button("Original Order", id="sort-original-btn"),
+                        html.Button("Sort by Success Rate \u2193", id="sort-success-btn"),
+                        html.Button("Sort by Success Rate \u2191", id="sort-success-asc-btn"),
+                        html.Button("Sort by Quality Score [%] \u2193", id="sort-quality-btn"),
+                        html.Button("Sort by Quality Score [%] \u2191", id="sort-quality-asc-btn"),
+                        html.Button("Sort by Attempt Drop-in \u2193", id="sort-dropin-btn"),
+                        html.Button("Sort by Attempt Drop-in \u2191", id="sort-dropin-asc-btn"),
+                    ],
+                ),
             ],
         ),
         html.Div(id="sort-status", style={"marginTop": "6px", "fontSize": "13px"}),
-        dcc.Checklist(id="policy-checklist", options=[], value=[], inline=True, style={"marginTop": "8px"}),
+        html.Div(
+            style={"marginTop": "8px"},
+            children=[
+                html.Label("Policies to include", style={"fontSize": "13px", "fontWeight": "600"}),
+                dcc.Checklist(
+                    id="policy-checklist",
+                    options=[],
+                    value=[],
+                    inline=False,
+                    style={
+                        "marginTop": "6px",
+                        "maxHeight": "180px",
+                        "overflowY": "auto",
+                        "border": "1px solid #e0e0e0",
+                        "borderRadius": "6px",
+                        "padding": "8px 10px",
+                        "background": "#fafafa",
+                        "columnCount": 2,
+                        "columnGap": "16px",
+                    },
+                    labelStyle={"display": "block", "marginBottom": "4px", "whiteSpace": "nowrap"},
+                ),
+            ],
+        ),
         dcc.Checklist(
             id="show-final-violin-toggle",
             options=[{"label": "Show final base-vs-policy violin panel", "value": "show"}],
@@ -763,20 +866,32 @@ def download_table(_: int, rows: list[dict] | None):
     Output("policy-b-dropdown", "value"),
     Output("policy-checklist", "options"),
     Output("policy-checklist", "value"),
+    Output("testing-group-dropdown", "options"),
+    Output("testing-group-dropdown", "value"),
+    Output("testing-group-dropdown", "disabled"),
+    Output("active-testing-group-store", "data"),
     Input("raw-table", "data"),
     Input("select-all-btn", "n_clicks"),
     Input("deselect-all-btn", "n_clicks"),
+    Input("apply-testing-group-btn", "n_clicks"),
+    Input("clear-testing-group-btn", "n_clicks"),
     State("policy-a-dropdown", "value"),
     State("policy-b-dropdown", "value"),
     State("policy-checklist", "value"),
+    State("testing-group-dropdown", "value"),
+    State("active-testing-group-store", "data"),
 )
 def sync_policy_selectors(
     rows: list[dict] | None,
     _select_all_clicks: int,
     _deselect_all_clicks: int,
+    _apply_testing_group_clicks: int,
+    _clear_testing_group_clicks: int,
     current_a: str | None,
     current_b: str | None,
     current_checked: list[str] | None,
+    selected_testing_group: str | None,
+    current_active_group: str | None,
 ):
     clean_df = _raw_to_clean_df(rows)
     if "has_success_rate_input" in clean_df.columns and not clean_df.empty:
@@ -788,12 +903,47 @@ def sync_policy_selectors(
     display_map, _pfx = _make_display_names(models)
     options = [{"label": display_map.get(model, model), "value": model} for model in models]
 
+    tag_df = clean_df.copy()
+    if not tag_df.empty:
+        tag_df = tag_df[tag_df["model_name"].astype(str).isin(models)].copy()
+        tag_df = tag_df.sort_values("source_order", kind="stable")
+    if "testing_group" not in tag_df.columns:
+        tag_df["testing_group"] = pd.NA
+    if "is_base_group" not in tag_df.columns:
+        tag_df["is_base_group"] = False
+
+    tag_df["testing_group"] = tag_df["testing_group"].astype(str).str.strip()
+    tag_df["testing_group"] = tag_df["testing_group"].replace({"": pd.NA, "nan": pd.NA, "none": pd.NA})
+    tag_df["is_base_group"] = tag_df["is_base_group"].fillna(False).astype(bool)
+
+    non_base_tag_df = tag_df[tag_df["testing_group"].notna() & (~tag_df["is_base_group"])].copy()
+    tag_order = non_base_tag_df["testing_group"].astype(str).drop_duplicates().tolist()
+    tag_options = [{"label": tag, "value": tag} for tag in tag_order]
+    tag_set = set(tag_order)
+
+    base_models = tag_df.loc[tag_df["is_base_group"], "model_name"].astype(str).drop_duplicates().tolist()
+    if not base_models and current_a in models:
+        base_models = [str(current_a)]
+
+    group_to_models: dict[str, list[str]] = {}
+    for tag in tag_order:
+        tag_models = (
+            non_base_tag_df.loc[non_base_tag_df["testing_group"].astype(str) == tag, "model_name"]
+            .astype(str)
+            .drop_duplicates()
+            .tolist()
+        )
+        group_to_models[tag] = [model for model in models if model in set(tag_models)]
+
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else "raw-table"
 
     if current_a in models:
         policy_a = current_a
     else:
         policy_a = models[0] if models else None
+
+    if not base_models and policy_a in models:
+        base_models = [str(policy_a)]
 
     remaining_for_b = [m for m in models if m != policy_a]
     if current_b in models and current_b != policy_a:
@@ -802,16 +952,64 @@ def sync_policy_selectors(
         policy_b = remaining_for_b[0] if remaining_for_b else (models[0] if models else None)
 
     current_checked = current_checked or []
+    active_group = str(current_active_group) if current_active_group in tag_set else None
+
+    def _group_plus_base_selection(group_name: str) -> list[str]:
+        selected = set(group_to_models.get(group_name, []))
+        selected.update(base_models)
+        return [model for model in models if model in selected]
+
     if trigger == "select-all-btn":
         checked = eligible_models
+        active_group = None
     elif trigger == "deselect-all-btn":
         checked = []
+        active_group = None
+    elif trigger == "apply-testing-group-btn":
+        requested_group = str(selected_testing_group) if selected_testing_group in tag_set else None
+        if requested_group is not None:
+            checked = _group_plus_base_selection(requested_group)
+            active_group = requested_group
+        else:
+            checked = [m for m in current_checked if m in models]
+            if not checked:
+                checked = eligible_models
+            active_group = None
+    elif trigger == "clear-testing-group-btn":
+        checked = eligible_models
+        active_group = None
+    elif trigger == "raw-table" and active_group in tag_set:
+        checked = _group_plus_base_selection(active_group)
     else:
         checked = [m for m in current_checked if m in models]
         if not checked:
             checked = eligible_models
 
-    return options, policy_a, options, policy_b, options, checked
+    dropdown_disabled = len(tag_options) == 0
+    if dropdown_disabled:
+        dropdown_value = None
+        active_group = None
+    elif trigger == "clear-testing-group-btn":
+        dropdown_value = None
+    elif selected_testing_group in tag_set:
+        dropdown_value = str(selected_testing_group)
+    elif active_group in tag_set:
+        dropdown_value = str(active_group)
+    else:
+        dropdown_value = None
+
+    return (
+        options,
+        policy_a,
+        options,
+        policy_b,
+        options,
+        checked,
+        tag_options,
+        dropdown_value,
+        dropdown_disabled,
+        active_group,
+    )
 
 
 @app.callback(
@@ -842,6 +1040,7 @@ def sync_policy_selectors(
     Input("policy-a-dropdown", "value"),
     Input("policy-b-dropdown", "value"),
     Input("policy-checklist", "value"),
+    Input("active-testing-group-store", "data"),
     Input("show-final-violin-toggle", "value"),
     Input("sort-mode-store", "data"),
     Input("show-allvsall-violin-toggle", "value"),
@@ -852,6 +1051,7 @@ def update_analysis(
     policy_a: str | None,
     policy_b: str | None,
     selected_policies: list[str] | None,
+    active_testing_group: str | None,
     show_final_violin_toggle: list[str] | None,
     sort_mode: str | None,
     show_allvsall_violin_toggle: list[str] | None,
@@ -859,6 +1059,8 @@ def update_analysis(
     clean_df = _raw_to_clean_df(rows)
     show_final_violin = "show" in (show_final_violin_toggle or [])
     show_allvsall_violin = "show" in (show_allvsall_violin_toggle or [])
+    active_group_label = str(active_testing_group).strip() if active_testing_group else ""
+    active_group_label = active_group_label if active_group_label else None
     final_violin_style = {"display": "block"} if show_final_violin else {"display": "none"}
     allvsall_violin_style = {"display": "block"} if show_allvsall_violin else {"display": "none"}
 
@@ -885,7 +1087,7 @@ def update_analysis(
             [],
             allvsall_violin_style,
             _empty_figure("No policy data"),
-            f"Order mode: {SORT_MODE_LABELS.get(sort_mode or 'original', 'Original sheet order')}",
+            _format_sort_status(sort_mode, active_group=active_group_label),
         )
 
     analysis_df = clean_df.copy()
@@ -915,7 +1117,7 @@ def update_analysis(
             [],
             allvsall_violin_style,
             _empty_figure("No concluded policies selected"),
-            f"Order mode: {SORT_MODE_LABELS.get(sort_mode or 'original', 'Original sheet order')}",
+            _format_sort_status(sort_mode, active_group=active_group_label),
         )
 
     metrics = prepare_policy_metrics(analysis_df, confidence_level)
@@ -923,6 +1125,12 @@ def update_analysis(
     all_names = metrics["model_name"].astype(str).tolist()
     display_map, prefix = _make_display_names(all_names)
     _prefix_sub = f"<br><sup>common prefix: {prefix}</sup>" if prefix else ""
+    _multi_sub_parts: list[str] = []
+    if active_group_label:
+        _multi_sub_parts.append(f"testing group: {active_group_label} + Base")
+    if prefix:
+        _multi_sub_parts.append(f"common prefix: {prefix}")
+    _multi_sub = f"<br><sup>{' | '.join(_multi_sub_parts)}</sup>" if _multi_sub_parts else ""
     policy_colors = _policy_color_map(all_names)
     alpha = 1.0 - confidence_level
     has_quality_std = (
@@ -1481,7 +1689,7 @@ def update_analysis(
             template="plotly_white",
             yaxis_title="Success Rate (%)",
             xaxis_title="Policy",
-            title=f"Selected policies with {int(confidence_level * 100)}% Wilson CIs{_prefix_sub}",
+            title=f"Selected policies with {int(confidence_level * 100)}% Wilson CIs{_multi_sub}",
             yaxis_range=[0, min(105, max(5, math.ceil((plot_df["wilson_high"].max() * 100) / 5) * 5 + 5))],
         )
 
@@ -1534,7 +1742,7 @@ def update_analysis(
                 template="plotly_white",
                 yaxis_title="Quality Score (%)",
                 xaxis_title="Policy",
-                title="Selected policies quality score" + (f" with {int(confidence_level * 100)}% CIs" if mp_has_q_std else "") + _prefix_sub,
+                title="Selected policies quality score" + (f" with {int(confidence_level * 100)}% CIs" if mp_has_q_std else "") + _multi_sub,
                 yaxis_range=[0, min(105, max(5, math.ceil(mp_q_max / 5) * 5 + 5))],
             )
         else:
@@ -1575,7 +1783,7 @@ def update_analysis(
                 template="plotly_white",
                 yaxis_title="Attempt Drop-in Ratio (%)",
                 xaxis_title="Policy",
-                title=f"Selected policies attempt drop-in with {int(confidence_level * 100)}% Wilson CIs{_prefix_sub}",
+                title=f"Selected policies attempt drop-in with {int(confidence_level * 100)}% Wilson CIs{_multi_sub}",
                 yaxis_range=[0, min(105, max(5, math.ceil(_mp_di_max / 5) * 5 + 5))],
             )
         else:
@@ -1633,7 +1841,7 @@ def update_analysis(
                 template="plotly_white",
                 xaxis_title="Success Rate (%)",
                 yaxis_title="Quality Score (%)",
-                title=f"Success Rate vs Quality Score{_prefix_sub}",
+                title=f"Success Rate vs Quality Score{_multi_sub}",
             )
         else:
             sr_vs_q_fig = _empty_figure("No quality data for scatter view")
@@ -1645,13 +1853,12 @@ def update_analysis(
                 pair_letters_df=pair_letters_df,
                 policy_colors=policy_colors,
                 display_names=display_map,
+                title_suffix=_multi_sub,
             )
         else:
             violin_fig = go.Figure()
 
-    sort_status = f"Order mode: {SORT_MODE_LABELS.get(sort_mode or 'original', 'Original sheet order')}"
-    if prefix:
-        sort_status += f" | common prefix: {prefix}"
+    sort_status = _format_sort_status(sort_mode, prefix=prefix, active_group=active_group_label)
 
     # Conditional row styling: highlight significant comparisons
     cld_row_styles: list[dict] = []
@@ -1724,7 +1931,7 @@ def update_analysis(
                 plot_df,
                 cld_letters,
                 policy_colors,
-                f"All-vs-all posterior uncertainty (Bayesian CLD){_prefix_sub}",
+                f"All-vs-all posterior uncertainty (Bayesian CLD){_multi_sub}",
                 display_names=display_map,
             )
         else:
