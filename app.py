@@ -12,8 +12,12 @@ from dash import dash_table
 
 from data_utils import (
     CSV_SINGLE_SHEET_NAME,
+    DEFAULT_GOOGLE_SHEET_URL,
     DEFAULT_TRIALS,
+    get_google_auth_status,
+    list_google_spreadsheet_sheets,
     list_local_spreadsheet_sheets,
+    load_google_spreadsheet,
     load_local_spreadsheet,
     normalize_policy_dataframe,
 )
@@ -516,27 +520,68 @@ app.layout = html.Div(
         dcc.Store(id="sort-mode-store", data="original"),
         dcc.Store(id="active-testing-group-store", data=None),
         html.H2("Robot Policy Evaluation Dashboard"),
-        html.P("Upload a local CSV/XLSX, edit/log rollout results, and compare policies with Wilson confidence intervals."),
+        html.P(
+            "Upload a local CSV/XLSX or paste a Google Sheets link, then edit/log rollout results "
+            "and compare policies with Wilson confidence intervals."
+        ),
         html.Hr(),
         html.Div(
-            style={"display": "flex", "gap": "10px", "alignItems": "center"},
+            style={"display": "grid", "gap": "8px"},
             children=[
-                dcc.Upload(
-                    id="local-file-upload",
-                    children=html.Button("Upload CSV/XLSX"),
-                    accept=".csv,.xlsx,.xls",
-                    multiple=False,
-                ),
                 html.Div(
-                    style={"minWidth": "250px"},
+                    style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"},
                     children=[
-                        html.Label("Sheet", style={"fontSize": "12px", "marginBottom": "2px"}),
-                        dcc.Dropdown(id="sheet-name-dropdown", options=[], value=None, clearable=False, disabled=True),
+                        dcc.Upload(
+                            id="local-file-upload",
+                            children=html.Button("Upload CSV/XLSX"),
+                            accept=".csv,.xlsx,.xls",
+                            multiple=False,
+                        ),
+                        html.Div(
+                            style={"minWidth": "250px"},
+                            children=[
+                                html.Label("Sheet", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                dcc.Dropdown(id="sheet-name-dropdown", options=[], value=None, clearable=False, disabled=True),
+                            ],
+                        ),
+                        html.Button("Add Row", id="add-row-btn"),
+                        html.Button("Download CSV", id="download-btn"),
+                        dcc.Download(id="download-csv"),
                     ],
                 ),
-                html.Button("Add Row", id="add-row-btn"),
-                html.Button("Download CSV", id="download-btn"),
-                dcc.Download(id="download-csv"),
+                html.Div(
+                    style={"display": "flex", "gap": "10px", "alignItems": "flex-end", "flexWrap": "wrap"},
+                    children=[
+                        html.Div(
+                            style={"minWidth": "360px", "flex": "1 1 600px"},
+                            children=[
+                                html.Label("Google Sheets URL", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                dcc.Input(
+                                    id="google-sheet-url",
+                                    type="text",
+                                    value=DEFAULT_GOOGLE_SHEET_URL,
+                                    placeholder="https://docs.google.com/spreadsheets/d/<id>/edit",
+                                    debounce=True,
+                                    style={"width": "100%"},
+                                ),
+                            ],
+                        ),
+                        html.Button("Load/Refresh Google Sheet", id="load-google-sheet-btn"),
+                        html.Div(
+                            style={"display": "grid", "gap": "2px", "paddingBottom": "4px"},
+                            children=[
+                                html.Div(
+                                    "First load may open a Google sign-in browser window.",
+                                    style={"fontSize": "12px", "color": "#666"},
+                                ),
+                                html.Div(
+                                    id="google-auth-status",
+                                    style={"fontSize": "12px", "color": "#666"},
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
             ],
         ),
         html.Div(id="load-status", style={"marginTop": "8px"}),
@@ -754,6 +799,33 @@ def update_sort_mode(
 
 
 @app.callback(
+    Output("google-auth-status", "children"),
+    Output("google-auth-status", "style"),
+    Input("google-sheet-url", "value"),
+    Input("load-google-sheet-btn", "n_clicks"),
+)
+def update_google_auth_status(
+    _google_sheet_url: str | None,
+    _load_google_sheet_clicks: int | None,
+):
+    status = get_google_auth_status()
+    message = f"Google auth: {status.get('message', 'status unavailable')}"
+
+    base_style = {
+        "fontSize": "12px",
+        "paddingBottom": "0px",
+    }
+    if bool(status.get("ready")):
+        color = "#2e7d32"
+    elif str(status.get("state")) in {"signin", "setup"}:
+        color = "#ef6c00"
+    else:
+        color = "#c62828"
+
+    return message, {**base_style, "color": color}
+
+
+@app.callback(
     Output("raw-table", "data"),
     Output("raw-table", "columns"),
     Output("load-status", "children"),
@@ -763,21 +835,33 @@ def update_sort_mode(
     Output("sheet-name-dropdown", "disabled"),
     Input("local-file-upload", "contents"),
     Input("sheet-name-dropdown", "value"),
+    Input("load-google-sheet-btn", "n_clicks"),
     State("local-file-upload", "filename"),
+    State("google-sheet-url", "value"),
     State("uploaded-file-store", "data"),
     prevent_initial_call=True,
 )
 def load_file_to_table(
     upload_contents: str | None,
     selected_sheet_name: str | None,
+    _load_google_sheet_clicks: int,
     filename: str | None,
+    google_sheet_url: str | None,
     stored_upload: dict | None,
 ):
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else None
 
     if trigger == "local-file-upload":
         if not upload_contents:
-            return no_update, no_update, "Upload a CSV/XLSX file first.", no_update, no_update, no_update, no_update
+            return (
+                no_update,
+                no_update,
+                "Upload a CSV/XLSX file first.",
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+            )
 
         try:
             sheets = list_local_spreadsheet_sheets(upload_contents, filename)
@@ -786,37 +870,88 @@ def load_file_to_table(
 
         default_sheet = sheets[0] if sheets else CSV_SINGLE_SHEET_NAME
         upload_state = {
+            "source": "local",
             "contents": upload_contents,
             "filename": filename,
             "sheets": sheets,
+            "default_sheet": default_sheet,
+        }
+    elif trigger == "load-google-sheet-btn":
+        clean_url = str(google_sheet_url or "").strip()
+        if not clean_url:
+            return (
+                no_update,
+                no_update,
+                "Paste a Google Sheets URL first.",
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+            )
+
+        try:
+            metadata = list_google_spreadsheet_sheets(clean_url)
+        except Exception as exc:
+            return no_update, no_update, f"Error: {exc}", no_update, no_update, no_update, no_update
+
+        sheet_entries = metadata.get("sheets") or []
+        sheets = [str(entry.get("name")) for entry in sheet_entries if str(entry.get("name", "")).strip()]
+        default_sheet = str(metadata.get("default_sheet") or (sheets[0] if sheets else CSV_SINGLE_SHEET_NAME))
+        upload_state = {
+            "source": "google",
+            "url": clean_url,
+            "spreadsheet_id": metadata.get("spreadsheet_id"),
+            "sheet_title": metadata.get("title") or "Google Sheet",
+            "sheets": sheets,
+            "default_sheet": default_sheet,
         }
     else:
-        if not stored_upload or "contents" not in stored_upload:
-            return no_update, no_update, "Upload a CSV/XLSX file first.", no_update, no_update, no_update, no_update
+        if not stored_upload:
+            return (
+                no_update,
+                no_update,
+                "Upload a CSV/XLSX file or load a Google Sheet first.",
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+            )
         upload_state = stored_upload
         sheets = upload_state.get("sheets") or [CSV_SINGLE_SHEET_NAME]
-        default_sheet = selected_sheet_name or sheets[0]
+        default_sheet = selected_sheet_name or upload_state.get("default_sheet") or sheets[0]
 
     if selected_sheet_name and selected_sheet_name in sheets:
         sheet_name = selected_sheet_name
     else:
-        sheet_name = default_sheet
+        sheet_name = default_sheet if default_sheet in sheets else (sheets[0] if sheets else CSV_SINGLE_SHEET_NAME)
 
     options = [{"label": name, "value": name} for name in sheets]
     disabled = len(sheets) <= 1
 
     try:
-        df = load_local_spreadsheet(upload_state["contents"], upload_state.get("filename"), sheet_name=sheet_name)
+        source = str(upload_state.get("source") or "local")
+        if source == "google":
+            df = load_google_spreadsheet(upload_state.get("url", ""), sheet_name=sheet_name)
+        else:
+            df = load_local_spreadsheet(upload_state["contents"], upload_state.get("filename"), sheet_name=sheet_name)
         normalized = normalize_policy_dataframe(df)
     except Exception as exc:
         return no_update, no_update, f"Error: {exc}", upload_state, options, sheet_name, disabled
 
     columns = [{"name": col, "id": col, "editable": col not in {"success_rate", "wilson_low", "wilson_high"}} for col in normalized.columns]
-    display_name = upload_state.get("filename") or "uploaded file"
-    if disabled:
-        status = f"Loaded {len(normalized)} rows from {display_name}."
+    source = str(upload_state.get("source") or "local")
+    if source == "google":
+        display_name = upload_state.get("sheet_title") or "Google Sheet"
+        if disabled:
+            status = f"Loaded {len(normalized)} rows from Google Sheet: {display_name}."
+        else:
+            status = f"Loaded {len(normalized)} rows from Google Sheet: {display_name} (tab: {sheet_name})."
     else:
-        status = f"Loaded {len(normalized)} rows from {display_name} (sheet: {sheet_name})."
+        display_name = upload_state.get("filename") or "uploaded file"
+        if disabled:
+            status = f"Loaded {len(normalized)} rows from {display_name}."
+        else:
+            status = f"Loaded {len(normalized)} rows from {display_name} (sheet: {sheet_name})."
 
     return normalized.to_dict("records"), columns, status, upload_state, options, sheet_name, disabled
 
