@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 .DS_Store
+.env
+google_oauth_client_secret.json
+google_oauth_client_secret*.json
 *service-account*.json
 *credentials*.json
 erudite-variety-489900-b4-ff1cd4309f66.json

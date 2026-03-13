@@ -1,11 +1,14 @@
 # Robot Policy Evaluation Dashboard (Dash)
 
-Minimal interactive dashboard for tracking robot policy rollout experiments from locally uploaded spreadsheets.
+Minimal interactive dashboard for tracking robot policy rollout experiments from local files or Google Sheets links.
 
 ## Features
 
 - Upload a local CSV/XLSX file (e.g., downloaded from Google Sheets).
+- Paste a Google Sheets URL and load/refresh directly in-app (no manual XLSX export needed).
+- Shows a small in-app Google auth status hint (`ready` / `needs sign-in`) near the Google URL field.
 - Choose which sheet/tab to load when an XLSX file contains multiple sheets.
+- Reuse a default Google Sheets URL via `DEFAULT_GOOGLE_SHEET_URL`.
 - Edit/log rollout rows in-app.
 - Compute per-policy Wilson confidence intervals for success rates.
 - Compute per-policy quality-score confidence intervals (t-distribution) when a `Quality Score STD [%]` column is present.
@@ -52,14 +55,89 @@ uv run --python .venv/bin/python python app.py
 
 Open: `http://127.0.0.1:8050`
 
+### Google Sheets authentication
+
+Quickest Linux onboarding (recommended):
+
+```bash
+cp .env.example .env
+./scripts/setup_google_auth_linux.sh
+```
+
+This script:
+
+- updates `.env` with a default Google Sheet URL,
+- uses `gcloud` ADC login if available,
+- falls back to OAuth client flow if configured,
+- verifies sheet access immediately.
+
+The app uses this order for auth, to keep sign-in as frictionless as possible:
+
+1. **Application Default Credentials (ADC)** (best for company-managed setups).
+2. **Cached OAuth token** from a previous sign-in.
+3. **Interactive OAuth browser popup** (first-time fallback).
+
+#### Option A — Company users via ADC (least friction)
+
+Install Google Cloud SDK (Ubuntu/Debian):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+sudo apt-get update && sudo apt-get install -y google-cloud-cli
+```
+
+Then authenticate once:
+
+```bash
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/spreadsheets.readonly
+```
+
+#### Option B — OAuth Desktop client (fallback when ADC is unavailable)
+
+For team onboarding, one admin can create the OAuth client once and share the downloaded JSON securely.
+
+Create/download OAuth client JSON:
+
+1. Open `https://console.cloud.google.com/apis/library/sheets.googleapis.com` and enable **Google Sheets API**.
+2. Open `https://console.cloud.google.com/apis/credentials`.
+3. Configure OAuth consent screen as **Internal** (company workspace) if applicable.
+4. Click **Create Credentials → OAuth client ID → Desktop app**.
+5. Download the JSON file.
+
+Use it in this project:
+
+```bash
+cp /path/from/downloads/client_secret_*.json ./google_oauth_client_secret.json
+./scripts/setup_google_auth_linux.sh --client-secret ./google_oauth_client_secret.json
+```
+
+Or set env var directly:
+
+```bash
+export GOOGLE_OAUTH_CLIENT_SECRET_FILE=/path/to/client_secret.json
+```
+
+On first Google Sheet load (or bootstrap verification), a browser sign-in/consent tab opens automatically.
+
+Optional env vars:
+
+- `DEFAULT_GOOGLE_SHEET_URL` — pre-filled URL in the app input field.
+  - Current fallback default is preconfigured to your primary sheet URL and can be overridden with this env var.
+- `GOOGLE_OAUTH_CLIENT_SECRET_FILE` — OAuth desktop client JSON path.
+- `GOOGLE_OAUTH_TOKEN_CACHE` — token cache path (default: `~/.config/policy_eval_dashboard/google_oauth_token.json`).
+
 ## Input workflow
 
-1. In Google Sheets, click `File -> Download` and export as `CSV` or `XLSX`.
-2. In the app, click `Upload CSV/XLSX` and pick the downloaded file.
-3. If the file has multiple sheets (XLSX), use the `Sheet` dropdown to select the tab you want to analyze.
-4. Review/edit rows in the table and continue with analysis.
+1. Choose one of two paths:
+  - **Local file**: export `CSV`/`XLSX` and click `Upload CSV/XLSX`.
+  - **Google link**: paste the spreadsheet URL and click `Load/Refresh Google Sheet`.
+2. If the source has multiple tabs, use the `Sheet` dropdown to select the tab you want to analyze.
+3. Review/edit rows in the table and continue with analysis.
 
-No API keys or Google authentication are required.
+For Google links, authentication is required (handled automatically as above).
 
 Note: CSV files have a single table only, so there is no sheet selection for CSV.
 
