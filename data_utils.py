@@ -44,6 +44,25 @@ GOOGLE_SHEETS_READONLY_SCOPE = "https://www.googleapis.com/auth/spreadsheets.rea
 DEFAULT_GOOGLE_SHEET_URL = os.getenv("DEFAULT_GOOGLE_SHEET_URL", FALLBACK_DEFAULT_GOOGLE_SHEET_URL).strip()
 DEFAULT_GOOGLE_OAUTH_CLIENT_SECRET_FILE = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET_FILE", "").strip()
 DEFAULT_GOOGLE_OAUTH_TOKEN_CACHE = os.getenv("GOOGLE_OAUTH_TOKEN_CACHE", "").strip()
+EVAL_DETAILS_COLUMN_CANDIDATES = [
+    "Eval Details",
+    "Evaluation Details",
+    "Eval Detail",
+    "Rollout Details",
+    "Details",
+    "Detail Link",
+    "Details Link",
+]
+EVAL_DETAILS_URL_COLUMN_CANDIDATES = [
+    "eval_details_url",
+    "Eval Details URL",
+    "Evaluation Details URL",
+    "Detail URL",
+    "Details URL",
+    "Rollout Details URL",
+    "EvalDetailsURL",
+    "DetailURL",
+]
 
 
 def _find_column(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
@@ -208,6 +227,34 @@ def _parse_google_spreadsheet_url(spreadsheet_url: str) -> tuple[str, str | None
 
     gid = str(query_gid or fragment_gid) if (query_gid or fragment_gid) is not None else None
     return spreadsheet_id, gid
+
+
+def _extract_url_from_value(value: object) -> str | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return None
+
+    formula_match = re.search(
+        r'(?is)=\s*HYPERLINK\(\s*(?:"([^"]+)"|\'([^\']+)\')',
+        text,
+    )
+    if formula_match:
+        url = formula_match.group(1) or formula_match.group(2)
+        if url:
+            return url.strip()
+
+    url_match = re.search(r"https?://[^\s\)\]\}\"']+", text)
+    if url_match:
+        return url_match.group(0).rstrip(".,;)")
+
+    return None
+
+
+def extract_url_from_cell_value(value: object) -> str | None:
+    return _extract_url_from_value(value)
 
 
 def _google_token_cache_path() -> Path:
@@ -443,18 +490,109 @@ def _sheet_values_to_dataframe(rows: list[list[object]]) -> pd.DataFrame:
     return out
 
 
-def list_google_spreadsheet_sheets(spreadsheet_url: str) -> dict[str, object]:
-    spreadsheet_id, preferred_gid = _parse_google_spreadsheet_url(spreadsheet_url)
+def _overlay_hyperlink_formulas(
+    base_rows: list[list[object]],
+    formula_rows: list[list[object]],
+) -> list[list[object]]:
+    out_rows: list[list[object]] = []
+    max_rows = max(len(base_rows), len(formula_rows))
+    for row_index in range(max_rows):
+        base_row = list(base_rows[row_index]) if row_index < len(base_rows) else []
+        formula_row = formula_rows[row_index] if row_index < len(formula_rows) else []
+        max_cols = max(len(base_row), len(formula_row))
+        if len(base_row) < max_cols:
+            base_row.extend([pd.NA] * (max_cols - len(base_row)))
+
+        for col_index in range(max_cols):
+            formula_value = formula_row[col_index] if col_index < len(formula_row) else None
+            if isinstance(formula_value, str) and re.search(r"(?is)^\s*=\s*HYPERLINK\(", formula_value):
+                base_row[col_index] = formula_value
+
+        out_rows.append(base_row)
+
+    return out_rows
+
+
+def _sheet_hyperlink_map(service, spreadsheet_id: str, range_name: str) -> dict[tuple[int, int], str]:
+    response = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        ranges=[range_name],
+        includeGridData=True,
+        fields=(
+            "sheets(data(rowData(values(hyperlink,formattedValue,textFormatRuns(startIndex,format(link))))))"
+        ),
+    ).execute()
+
+    out: dict[tuple[int, int], str] = {}
+    sheets = response.get("sheets") or []
+    for sheet in sheets:
+        data_entries = sheet.get("data") or []
+        for data_entry in data_entries:
+            row_data = data_entry.get("rowData") or []
+            for row_index, row in enumerate(row_data):
+                values = row.get("values") or []
+                for col_index, cell in enumerate(values):
+                    url = str(cell.get("hyperlink") or "").strip()
+                    if not url:
+                        for run in cell.get("textFormatRuns") or []:
+                            link = ((run.get("format") or {}).get("link") or {}).get("uri")
+                            if link:
+                                url = str(link).strip()
+                                break
+                    if url:
+                        out[(row_index, col_index)] = url
+    return out
+
+
+def _overlay_hyperlink_map(
+    rows: list[list[object]],
+    hyperlink_map: dict[tuple[int, int], str],
+) -> list[list[object]]:
+    if not hyperlink_map:
+        return rows
+
+    out_rows: list[list[object]] = [list(row) for row in rows]
+    max_col_by_row: dict[int, int] = {}
+    for (row_index, col_index), _url in hyperlink_map.items():
+        max_col_by_row[row_index] = max(max_col_by_row.get(row_index, -1), col_index)
+
+    for row_index, max_col in max_col_by_row.items():
+        while len(out_rows) <= row_index:
+            out_rows.append([])
+        if len(out_rows[row_index]) <= max_col:
+            out_rows[row_index].extend([pd.NA] * (max_col + 1 - len(out_rows[row_index])))
+
+    for (row_index, col_index), url in hyperlink_map.items():
+        out_rows[row_index][col_index] = url
+
+    return out_rows
+
+
+def _rows_contain_any_url(rows: list[list[object]]) -> bool:
+    for row in rows:
+        for value in row:
+            if _extract_url_from_value(value):
+                return True
+    return False
+
+
+@functools.lru_cache(maxsize=64)
+def _google_spreadsheet_metadata(spreadsheet_id: str) -> dict[str, object]:
     _google_auth, _request, _credentials, _flow, _build, HttpError = _import_google_dependencies()
     service = _google_sheets_service()
 
     try:
-        metadata = service.spreadsheets().get(
+        return service.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
             fields="properties(title),sheets(properties(title,sheetId))",
         ).execute()
     except HttpError as exc:
         raise ValueError(_google_error_message(exc)) from exc
+
+
+def list_google_spreadsheet_sheets(spreadsheet_url: str) -> dict[str, object]:
+    spreadsheet_id, preferred_gid = _parse_google_spreadsheet_url(spreadsheet_url)
+    metadata = _google_spreadsheet_metadata(spreadsheet_id)
 
     sheets: list[dict[str, str]] = []
     default_sheet = None
@@ -486,6 +624,7 @@ def list_google_spreadsheet_sheets(spreadsheet_url: str) -> dict[str, object]:
 def load_google_spreadsheet(
     spreadsheet_url: str,
     sheet_name: str | None = None,
+    enrich_hyperlinks: bool = True,
 ) -> pd.DataFrame:
     spreadsheet_id, _preferred_gid = _parse_google_spreadsheet_url(spreadsheet_url)
     _google_auth, _request, _credentials, _flow, _build, HttpError = _import_google_dependencies()
@@ -513,7 +652,35 @@ def load_google_spreadsheet(
         raise ValueError(_google_error_message(exc)) from exc
 
     rows = values_result.get("values", [])
+
+    if enrich_hyperlinks:
+        try:
+            formula_result = service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueRenderOption="FORMULA",
+                dateTimeRenderOption="FORMATTED_STRING",
+            ).execute()
+            formula_rows = formula_result.get("values", [])
+            if formula_rows:
+                rows = _overlay_hyperlink_formulas(rows, formula_rows)
+        except Exception:
+            pass
+
+        if not _rows_contain_any_url(rows):
+            try:
+                hyperlink_map = _sheet_hyperlink_map(service, spreadsheet_id, range_name)
+                rows = _overlay_hyperlink_map(rows, hyperlink_map)
+            except Exception:
+                pass
+
     return _sheet_values_to_dataframe(rows)
+
+
+def promote_header_row_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    return _promote_header_from_any_row_if_needed(df.copy())
 
 
 def list_local_spreadsheet_sheets(upload_contents: str, filename: str | None) -> list[str]:
@@ -616,6 +783,16 @@ def normalize_policy_dataframe(df: pd.DataFrame, default_trials: int = DEFAULT_T
 
     out = out[out["model_name"].notna()].copy()
     out = out[out["model_name"].astype(str).str.strip().astype(bool)].copy()
+
+    eval_url_col = _find_column(out, EVAL_DETAILS_URL_COLUMN_CANDIDATES)
+    eval_details_col = _find_column(out, EVAL_DETAILS_COLUMN_CANDIDATES)
+    eval_details_urls = pd.Series(pd.NA, index=out.index, dtype="object")
+    if eval_url_col is not None:
+        eval_details_urls = out[eval_url_col].map(_extract_url_from_value)
+    if eval_details_col is not None:
+        parsed_from_details = out[eval_details_col].map(_extract_url_from_value)
+        eval_details_urls = eval_details_urls.where(eval_details_urls.notna(), parsed_from_details)
+    out["eval_details_url"] = eval_details_urls
 
     required_first = ["model_name", "successes", "trials"]
     remaining = [col for col in out.columns if col not in required_first]
