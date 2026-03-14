@@ -7,6 +7,7 @@ import re
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from dash import Dash, Input, Output, State, callback_context, dcc, html, no_update
 from dash import dash_table
 
@@ -14,12 +15,14 @@ from data_utils import (
     CSV_SINGLE_SHEET_NAME,
     DEFAULT_GOOGLE_SHEET_URL,
     DEFAULT_TRIALS,
+    extract_url_from_cell_value,
     get_google_auth_status,
     list_google_spreadsheet_sheets,
     list_local_spreadsheet_sheets,
     load_google_spreadsheet,
     load_local_spreadsheet,
     normalize_policy_dataframe,
+    promote_header_row_if_needed,
 )
 from stats_utils import (
     base_vs_policy_letter_pairs,
@@ -92,6 +95,54 @@ POLICY_COLOR_PALETTE = [
     "#7f7f7f",
     "#bcbd22",
     "#17becf",
+]
+
+FAILURE_METRIC_OPTIONS = [
+    {"label": "Failure rate (%)", "value": "failure_rate"},
+    {"label": "Success rate (%)", "value": "success_rate"},
+    {"label": "Quality score mean (%)", "value": "quality_score"},
+    {"label": "Sample count (n)", "value": "sample_count"},
+]
+
+FAILURE_TASK_SUCCESS_COLUMN_CANDIDATES = [
+    "Task Success",
+    "TaskSuccess",
+    "Success",
+    "Succeeded",
+    "Outcome",
+    "Result",
+]
+FAILURE_QUALITY_COLUMN_CANDIDATES = [
+    "Score based on rubric",
+    "Score Based On Rubric",
+    "Rubric Score",
+    "Quality Score",
+    "Quality",
+    "Score",
+]
+FAILURE_DEFAULT_X_COLUMN_CANDIDATES = [
+    "Relative Stance Offset",
+    "Robot Initial Pose",
+    "Robot Pose",
+    "Stance Offset",
+]
+FAILURE_DEFAULT_Y_COLUMN_CANDIDATES = [
+    "Tote on Pallet Offset",
+    "Stack Pose",
+    "Initial Stack Pose",
+    "Pallet Offset",
+]
+FAILURE_LINK_COLUMN_CANDIDATES = [
+    "eval_details_url",
+    "Eval Details URL",
+    "Evaluation Details URL",
+    "Detail URL",
+    "Details URL",
+    "Rollout Details URL",
+    "Eval Details",
+    "Evaluation Details",
+    "Rollout Details",
+    "Details",
 ]
 
 
@@ -510,6 +561,479 @@ def _build_base_vs_pairs_violin(
     return fig
 
 
+def _format_numeric_token(value: float) -> str:
+    if not math.isfinite(value):
+        return "NA"
+    rounded = round(value)
+    if abs(value - rounded) < 1e-9:
+        return str(int(rounded))
+    return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def _normalize_header_token(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+
+
+def _make_unique_columns(columns: list[str]) -> list[str]:
+    counts: dict[str, int] = {}
+    unique: list[str] = []
+
+    for idx, column in enumerate(columns):
+        base = str(column).strip()
+        if not base:
+            base = f"col_{idx + 1}"
+        counter = counts.get(base, 0) + 1
+        counts[base] = counter
+        unique.append(base if counter == 1 else f"{base}_{counter}")
+
+    return unique
+
+
+def _find_detail_header_row(detail_df: pd.DataFrame, max_scan_rows: int = 40) -> int | None:
+    if detail_df.empty:
+        return None
+
+    success_tokens = {_normalize_header_token(value) for value in FAILURE_TASK_SUCCESS_COLUMN_CANDIDATES}
+    quality_tokens = {_normalize_header_token(value) for value in FAILURE_QUALITY_COLUMN_CANDIDATES}
+    axis_tokens = {
+        _normalize_header_token(value)
+        for value in [
+            *FAILURE_DEFAULT_X_COLUMN_CANDIDATES,
+            *FAILURE_DEFAULT_Y_COLUMN_CANDIDATES,
+            "Task",
+            "# totes in stack",
+            "Totes in stack",
+        ]
+    }
+
+    best_row: int | None = None
+    best_rank: tuple[int, int, int, int] = (-1, -1, -1, -1)
+
+    scan_rows = min(max_scan_rows, len(detail_df))
+    for row_index in range(scan_rows):
+        tokens = [_normalize_header_token(value) for value in detail_df.iloc[row_index].tolist()]
+        tokens = [token for token in tokens if token]
+        token_set = set(tokens)
+
+        has_success = bool(token_set & success_tokens)
+        if not has_success:
+            continue
+
+        axis_hits = len(token_set & axis_tokens)
+        quality_hits = 1 if bool(token_set & quality_tokens) else 0
+        rank = (1, axis_hits, quality_hits, len(tokens))
+
+        if rank > best_rank:
+            best_rank = rank
+            best_row = row_index
+
+    return best_row
+
+
+def _promote_detail_header_row_if_needed(detail_df: pd.DataFrame) -> pd.DataFrame:
+    promoted = promote_header_row_if_needed(detail_df)
+    if _find_column(promoted, FAILURE_TASK_SUCCESS_COLUMN_CANDIDATES) is not None:
+        return promoted
+
+    header_row = _find_detail_header_row(detail_df)
+    if header_row is None:
+        return promoted
+
+    header_values = detail_df.iloc[header_row].tolist()
+    fallback_columns = [str(col) for col in detail_df.columns]
+
+    candidate_columns: list[str] = []
+    for idx, value in enumerate(header_values):
+        label = "" if pd.isna(value) else str(value).strip()
+        token = _normalize_header_token(label)
+        if not label or token in {"nan", "none"} or token.startswith("unnamed"):
+            fallback = fallback_columns[idx] if idx < len(fallback_columns) else ""
+            fallback = str(fallback).strip()
+            fallback_token = _normalize_header_token(fallback)
+            if fallback and not fallback_token.startswith("unnamed"):
+                label = fallback
+            else:
+                label = f"col_{idx + 1}"
+        candidate_columns.append(label)
+
+    promoted_detail = detail_df.iloc[header_row + 1 :].copy()
+    if promoted_detail.empty:
+        return promoted
+
+    promoted_detail.columns = _make_unique_columns(candidate_columns)
+    promoted_detail = promoted_detail.dropna(how="all").reset_index(drop=True)
+    return promoted_detail
+
+
+def _normalize_condition_token(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "NA"
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return "NA"
+
+    bracket_match = re.match(r"^[\[(]\s*(.*?)\s*[\])]$", text)
+    if bracket_match:
+        raw_parts = [part.strip() for part in bracket_match.group(1).split(",")]
+        parsed_parts: list[str] = []
+        for part in raw_parts:
+            if not part:
+                return text
+            parsed = pd.to_numeric(pd.Series([part]), errors="coerce").iloc[0]
+            if pd.isna(parsed):
+                return text
+            parsed_parts.append(_format_numeric_token(float(parsed)))
+        return "[" + ", ".join(parsed_parts) + "]"
+
+    parsed = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
+    if pd.notna(parsed):
+        return _format_numeric_token(float(parsed))
+
+    return text
+
+
+def _condition_sort_key(label: str) -> tuple:
+    if label == "NA":
+        return 3, ""
+
+    bracket_match = re.match(r"^\[\s*(.*?)\s*\]$", str(label))
+    if bracket_match:
+        raw_parts = [part.strip() for part in bracket_match.group(1).split(",")]
+        numbers: list[float] = []
+        for part in raw_parts:
+            parsed = pd.to_numeric(pd.Series([part]), errors="coerce").iloc[0]
+            if pd.isna(parsed):
+                numbers = []
+                break
+            numbers.append(float(parsed))
+        if numbers:
+            return 0, len(numbers), tuple(numbers)
+
+    parsed = pd.to_numeric(pd.Series([label]), errors="coerce").iloc[0]
+    if pd.notna(parsed):
+        return 1, float(parsed)
+
+    return 2, str(label).lower()
+
+
+def _condition_key(column_name: str) -> str:
+    token = re.sub(r"[^a-z0-9]+", "_", column_name.strip().lower()).strip("_")
+    token = token or "condition"
+    digest = hashlib.md5(column_name.strip().lower().encode("utf-8")).hexdigest()[:8]
+    return f"cond__{token}_{digest}"
+
+
+def _safe_policy_name_from_row(row: dict[str, object]) -> str:
+    for key in ["model_name", "Model Name", "Model", "Policy", "Policy Name"]:
+        if key in row:
+            text = str(row.get(key, "")).strip()
+            if text and text.lower() not in {"nan", "none"}:
+                return text
+    return ""
+
+
+def _collect_policy_detail_links(rows: list[dict] | None) -> list[dict[str, str]]:
+    collected: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+
+        policy_name = _safe_policy_name_from_row(row)
+        if not policy_name:
+            continue
+
+        detail_url: str | None = None
+        for key in FAILURE_LINK_COLUMN_CANDIDATES:
+            if key not in row:
+                continue
+            detail_url = extract_url_from_cell_value(row.get(key))
+            if detail_url:
+                break
+
+        if detail_url is None:
+            for key, value in row.items():
+                token = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                if "detail" not in token:
+                    continue
+                parsed = extract_url_from_cell_value(value)
+                if parsed:
+                    detail_url = parsed
+                    break
+
+        if not detail_url:
+            continue
+        if "/spreadsheets/d/" not in detail_url:
+            continue
+
+        dedup_key = (policy_name, detail_url)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        collected.append({"policy_name": policy_name, "detail_url": detail_url})
+
+    return collected
+
+
+def _parse_task_success_value(value: object) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "success", "succeeded", "pass", "passed"}:
+        return 1.0
+    if text in {"0", "false", "f", "no", "n", "fail", "failed", "failure"}:
+        return 0.0
+
+    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(parsed):
+        return None
+    return 1.0 if float(parsed) > 0 else 0.0
+
+
+def _normalize_detail_rollout_frame(
+    detail_df: pd.DataFrame,
+    policy_name: str,
+    detail_url: str,
+) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
+    working = _promote_detail_header_row_if_needed(detail_df)
+    if working.empty:
+        return [], []
+
+    success_col = _find_column(working, FAILURE_TASK_SUCCESS_COLUMN_CANDIDATES)
+    if success_col is None:
+        raise ValueError("Missing 'Task Success' column in detail sheet")
+
+    quality_col = _find_column(working, FAILURE_QUALITY_COLUMN_CANDIDATES)
+    quality_values = (
+        _to_percent_points(working[quality_col])
+        if quality_col is not None
+        else pd.Series(pd.NA, index=working.index)
+    )
+
+    condition_columns: list[tuple[str, str, pd.Series]] = []
+    for column in working.columns:
+        column_name = str(column).strip()
+        if not column_name:
+            continue
+        if column_name == success_col:
+            continue
+        if quality_col is not None and column_name == quality_col:
+            continue
+
+        normalized = working[column].map(_normalize_condition_token)
+        non_na = normalized[normalized != "NA"]
+        unique_count = int(non_na.nunique(dropna=True))
+        if unique_count <= 1:
+            continue
+        if unique_count > max(80, int(len(working) * 0.95)):
+            continue
+
+        key = _condition_key(column_name)
+        condition_columns.append((key, column_name, normalized))
+
+    records: list[dict[str, object]] = []
+    for idx in range(len(working)):
+        success_value = _parse_task_success_value(working.iloc[idx][success_col])
+        if success_value is None:
+            continue
+
+        record: dict[str, object] = {
+            "policy_name": policy_name,
+            "detail_url": detail_url,
+            "task_success": success_value,
+            "quality_score_pct": math.nan,
+        }
+
+        quality_value = quality_values.iloc[idx]
+        if pd.notna(quality_value):
+            record["quality_score_pct"] = float(quality_value)
+
+        for key, _label, series in condition_columns:
+            record[key] = series.iloc[idx]
+
+        records.append(record)
+
+    metadata = [{"key": key, "label": label} for key, label, _series in condition_columns]
+    return records, metadata
+
+
+def _pick_default_condition_key(condition_columns: list[dict[str, str]], candidates: list[str]) -> str | None:
+    normalized_map = {
+        re.sub(r"[^a-z0-9]", "", str(entry.get("label", "")).lower()): str(entry.get("key", ""))
+        for entry in condition_columns
+        if str(entry.get("key", "")).strip()
+    }
+    for candidate in candidates:
+        key = normalized_map.get(re.sub(r"[^a-z0-9]", "", candidate.lower()))
+        if key:
+            return key
+    if condition_columns:
+        return str(condition_columns[0].get("key"))
+    return None
+
+
+def _failure_empty_figure(message: str) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        template="plotly_white",
+        xaxis_title="Condition",
+        yaxis_title="Condition",
+        annotations=[
+            {
+                "text": message,
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.5,
+                "y": 0.5,
+                "showarrow": False,
+            }
+        ],
+    )
+    return fig
+
+
+def _build_failure_policy_grid_figure(
+    cell_df: pd.DataFrame,
+    policy_names: list[str],
+    x_values: list[str],
+    y_values: list[str],
+    x_key: str,
+    y_key: str,
+    metric_key: str,
+    metric_label: str,
+    colorscale: str,
+    zmin: float | None,
+    zmax: float | None,
+    display_names: dict[str, str] | None = None,
+) -> go.Figure:
+    if not policy_names:
+        return _failure_empty_figure("No policies selected for failure heatmaps")
+
+    display = display_names or {}
+    n_cols = 4
+    n_rows = int(math.ceil(len(policy_names) / n_cols))
+    subplot_titles = [display.get(policy, policy) for policy in policy_names]
+
+    fig = make_subplots(
+        rows=n_rows,
+        cols=n_cols,
+        subplot_titles=subplot_titles,
+        horizontal_spacing=0.04,
+        vertical_spacing=0.16,
+    )
+
+    for index, policy_name in enumerate(policy_names):
+        row_idx = index // n_cols + 1
+        col_idx = index % n_cols + 1
+
+        policy_cells = cell_df[cell_df["policy_name"].astype(str) == str(policy_name)].copy()
+        z = (
+            policy_cells.pivot(index=y_key, columns=x_key, values=metric_key)
+            .reindex(index=y_values, columns=x_values)
+            .to_numpy()
+        )
+        n = (
+            policy_cells.pivot(index=y_key, columns=x_key, values="n")
+            .reindex(index=y_values, columns=x_values)
+            .fillna(0)
+            .to_numpy()
+        )
+
+        fig.add_trace(
+            go.Heatmap(
+                x=x_values,
+                y=y_values,
+                z=z,
+                customdata=n,
+                colorscale=colorscale,
+                zmin=zmin,
+                zmax=zmax,
+                showscale=index == 0,
+                colorbar={"title": metric_label} if index == 0 else None,
+                hovertemplate=(
+                    "%{y} × %{x}<br>"
+                    + metric_label
+                    + ": %{z:.2f}<br>n: %{customdata:.0f}<extra>"
+                    + display.get(policy_name, policy_name)
+                    + "</extra>"
+                ),
+            ),
+            row=row_idx,
+            col=col_idx,
+        )
+        fig.update_xaxes(tickangle=35, row=row_idx, col=col_idx)
+
+    fig.update_layout(
+        template="plotly_white",
+        title=f"Policy failure-mode mini-heatmaps ({metric_label})",
+        height=max(420, n_rows * 300),
+        margin={"l": 30, "r": 30, "t": 90, "b": 40},
+    )
+    return fig
+
+
+def _build_failure_aggregate_figure(
+    aggregate_df: pd.DataFrame,
+    x_values: list[str],
+    y_values: list[str],
+    x_key: str,
+    y_key: str,
+    metric_key: str,
+    metric_label: str,
+    colorscale: str,
+    zmin: float | None,
+    zmax: float | None,
+) -> go.Figure:
+    if aggregate_df.empty:
+        return _failure_empty_figure("No aggregate failure data available")
+
+    z = (
+        aggregate_df.pivot(index=y_key, columns=x_key, values=metric_key)
+        .reindex(index=y_values, columns=x_values)
+        .to_numpy()
+    )
+    n = (
+        aggregate_df.pivot(index=y_key, columns=x_key, values="n")
+        .reindex(index=y_values, columns=x_values)
+        .fillna(0)
+        .to_numpy()
+    )
+
+    fig = go.Figure(
+        data=[
+            go.Heatmap(
+                x=x_values,
+                y=y_values,
+                z=z,
+                customdata=n,
+                colorscale=colorscale,
+                zmin=zmin,
+                zmax=zmax,
+                colorbar={"title": metric_label},
+                hovertemplate=(
+                    "%{y} × %{x}<br>"
+                    + metric_label
+                    + ": %{z:.2f}<br>n: %{customdata:.0f}<extra>All selected policies</extra>"
+                ),
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_white",
+        title=f"Aggregate hardest conditions ({metric_label})",
+        xaxis_title="Robot condition (X)",
+        yaxis_title="Stack condition (Y)",
+        margin={"l": 30, "r": 30, "t": 70, "b": 50},
+    )
+    fig.update_xaxes(tickangle=35)
+    return fig
+
+
 app = Dash(__name__)
 app.title = "Robot Policy Evaluation Dashboard"
 
@@ -519,243 +1043,849 @@ app.layout = html.Div(
         dcc.Store(id="uploaded-file-store", data=None),
         dcc.Store(id="sort-mode-store", data="original"),
         dcc.Store(id="active-testing-group-store", data=None),
-        html.H2("Robot Policy Evaluation Dashboard"),
-        html.P(
-            "Upload a local CSV/XLSX or paste a Google Sheets link, then edit/log rollout results "
-            "and compare policies with Wilson confidence intervals."
+        dcc.Store(
+            id="failure-detail-store",
+            data={"records": [], "condition_columns": [], "default_x": None, "default_y": None},
         ),
-        html.Hr(),
-        html.Div(
-            style={"display": "grid", "gap": "8px"},
+        dcc.Tabs(
+            id="page-tabs",
+            value="main",
             children=[
-                html.Div(
-                    style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"},
-                    children=[
-                        dcc.Upload(
-                            id="local-file-upload",
-                            children=html.Button("Upload CSV/XLSX"),
-                            accept=".csv,.xlsx,.xls",
-                            multiple=False,
-                        ),
-                        html.Div(
-                            style={"minWidth": "250px"},
-                            children=[
-                                html.Label("Sheet", style={"fontSize": "12px", "marginBottom": "2px"}),
-                                dcc.Dropdown(id="sheet-name-dropdown", options=[], value=None, clearable=False, disabled=True),
-                            ],
-                        ),
-                        html.Button("Add Row", id="add-row-btn"),
-                        html.Button("Download CSV", id="download-btn"),
-                        dcc.Download(id="download-csv"),
-                    ],
+                dcc.Tab(label="Main Dashboard", value="main"),
+                dcc.Tab(label="Failure Mode Analysis", value="failure"),
+            ],
+        ),
+        html.Div(
+            id="main-page",
+            children=[
+                html.H2("Robot Policy Evaluation Dashboard"),
+                html.P(
+                    "Upload a local CSV/XLSX or paste a Google Sheets link, then edit/log rollout results "
+                    "and compare policies with Wilson confidence intervals."
                 ),
+                html.Hr(),
                 html.Div(
-                    style={"display": "flex", "gap": "10px", "alignItems": "flex-end", "flexWrap": "wrap"},
+                    style={"display": "grid", "gap": "8px"},
                     children=[
                         html.Div(
-                            style={"minWidth": "360px", "flex": "1 1 600px"},
+                            style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"},
                             children=[
-                                html.Label("Google Sheets URL", style={"fontSize": "12px", "marginBottom": "2px"}),
-                                dcc.Input(
-                                    id="google-sheet-url",
-                                    type="text",
-                                    value=DEFAULT_GOOGLE_SHEET_URL,
-                                    placeholder="https://docs.google.com/spreadsheets/d/<id>/edit",
-                                    debounce=True,
-                                    style={"width": "100%"},
-                                ),
-                            ],
-                        ),
-                        html.Button("Load/Refresh Google Sheet", id="load-google-sheet-btn"),
-                        html.Div(
-                            style={"display": "grid", "gap": "2px", "paddingBottom": "4px"},
-                            children=[
-                                html.Div(
-                                    "First load may open a Google sign-in browser window.",
-                                    style={"fontSize": "12px", "color": "#666"},
+                                dcc.Upload(
+                                    id="local-file-upload",
+                                    children=html.Button("Upload CSV/XLSX"),
+                                    accept=".csv,.xlsx,.xls",
+                                    multiple=False,
                                 ),
                                 html.Div(
-                                    id="google-auth-status",
-                                    style={"fontSize": "12px", "color": "#666"},
+                                    style={"minWidth": "250px"},
+                                    children=[
+                                        html.Label("Sheet", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Dropdown(id="sheet-name-dropdown", options=[], value=None, clearable=False, disabled=True),
+                                    ],
                                 ),
+                                html.Button("Add Row", id="add-row-btn"),
+                                html.Button("Download CSV", id="download-btn"),
+                                dcc.Download(id="download-csv"),
                             ],
                         ),
-                    ],
-                ),
-            ],
-        ),
-        html.Div(id="load-status", style={"marginTop": "8px"}),
-        dash_table.DataTable(
-            id="raw-table",
-            columns=_default_columns(),
-            data=[],
-            editable=True,
-            row_deletable=True,
-            page_size=12,
-            style_table={"overflowX": "auto", "marginTop": "8px"},
-            style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
-        ),
-        html.Hr(),
-        html.H4("Analysis settings"),
-        html.Div(
-            style={"maxWidth": "420px"},
-            children=[
-                html.Label("Confidence level"),
-                dcc.Dropdown(
-                    id="confidence-level",
-                    options=CONFIDENCE_OPTIONS,
-                    value=0.95,
-                    clearable=False,
-                ),
-            ],
-        ),
-        html.H4("Per-policy intervals (success rate & quality)"),
-        dash_table.DataTable(
-            id="summary-table",
-            columns=[],
-            data=[],
-            page_size=12,
-            style_table={"overflowX": "auto"},
-            style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
-        ),
-        html.Hr(),
-        html.H4("A/B comparison (base vs experimental)"),
-        html.Div(
-            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px", "maxWidth": "760px"},
-            children=[
-                html.Div(
-                    [
-                        html.Label("Policy A (base)"),
-                        dcc.Dropdown(id="policy-a-dropdown", options=[], value=None),
-                    ]
-                ),
-                html.Div(
-                    [
-                        html.Label("Policy B (experimental)"),
-                        dcc.Dropdown(id="policy-b-dropdown", options=[], value=None),
-                    ]
-                ),
-            ],
-        ),
-        html.Div(id="ab-output", style={"marginTop": "10px"}),
-        dcc.Graph(id="ab-comparison-graph"),
-        dcc.Graph(id="ab-quality-graph"),
-        dcc.Graph(id="ab-dropin-graph"),
-        dcc.Graph(id="ab-violin-graph"),
-        html.Hr(),
-        html.H4("Multi-policy comparison + compact letter display"),
-        html.Div(
-            style={"display": "grid", "gap": "8px"},
-            children=[
-                html.Div(
-                    style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
-                    children=[
-                        html.Button("Select All", id="select-all-btn"),
-                        html.Button("Deselect All", id="deselect-all-btn"),
                         html.Div(
-                            style={"minWidth": "260px", "maxWidth": "360px"},
+                            style={"display": "flex", "gap": "10px", "alignItems": "flex-end", "flexWrap": "wrap"},
                             children=[
-                                html.Label("Testing Group", style={"fontSize": "12px", "marginBottom": "2px"}),
-                                dcc.Dropdown(
-                                    id="testing-group-dropdown",
-                                    options=[],
-                                    value=None,
-                                    clearable=True,
-                                    placeholder="Select a tag",
-                                    disabled=True,
+                                html.Div(
+                                    style={"minWidth": "360px", "flex": "1 1 600px"},
+                                    children=[
+                                        html.Label("Google Sheets URL", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Input(
+                                            id="google-sheet-url",
+                                            type="text",
+                                            value=DEFAULT_GOOGLE_SHEET_URL,
+                                            placeholder="https://docs.google.com/spreadsheets/d/<id>/edit",
+                                            debounce=True,
+                                            style={"width": "100%"},
+                                        ),
+                                    ],
+                                ),
+                                html.Button("Load/Refresh Google Sheet", id="load-google-sheet-btn"),
+                                html.Div(
+                                    style={"display": "grid", "gap": "2px", "paddingBottom": "4px"},
+                                    children=[
+                                        html.Div(
+                                            "First load may open a Google sign-in browser window.",
+                                            style={"fontSize": "12px", "color": "#666"},
+                                        ),
+                                        html.Div(
+                                            id="google-auth-status",
+                                            style={"fontSize": "12px", "color": "#666"},
+                                        ),
+                                    ],
                                 ),
                             ],
                         ),
-                        html.Button("Plot Tag + Base", id="apply-testing-group-btn"),
-                        html.Button("Clear Tag Filter", id="clear-testing-group-btn"),
                     ],
                 ),
+                html.Div(id="load-status", style={"marginTop": "8px"}),
+                dash_table.DataTable(
+                    id="raw-table",
+                    columns=_default_columns(),
+                    data=[],
+                    editable=True,
+                    row_deletable=True,
+                    page_size=12,
+                    style_table={"overflowX": "auto", "marginTop": "8px"},
+                    style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
+                ),
+                html.Hr(),
+                html.H4("Analysis settings"),
                 html.Div(
-                    style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
+                    style={"maxWidth": "420px"},
                     children=[
-                        html.Button("Original Order", id="sort-original-btn"),
-                        html.Button("Sort by Success Rate \u2193", id="sort-success-btn"),
-                        html.Button("Sort by Success Rate \u2191", id="sort-success-asc-btn"),
-                        html.Button("Sort by Quality Score [%] \u2193", id="sort-quality-btn"),
-                        html.Button("Sort by Quality Score [%] \u2191", id="sort-quality-asc-btn"),
-                        html.Button("Sort by Attempt Drop-in \u2193", id="sort-dropin-btn"),
-                        html.Button("Sort by Attempt Drop-in \u2191", id="sort-dropin-asc-btn"),
+                        html.Label("Confidence level"),
+                        dcc.Dropdown(
+                            id="confidence-level",
+                            options=CONFIDENCE_OPTIONS,
+                            value=0.95,
+                            clearable=False,
+                        ),
                     ],
                 ),
-            ],
-        ),
-        html.Div(id="sort-status", style={"marginTop": "6px", "fontSize": "13px"}),
-        html.Div(
-            style={"marginTop": "8px"},
-            children=[
-                html.Label("Policies to include", style={"fontSize": "13px", "fontWeight": "600"}),
-                dcc.Checklist(
-                    id="policy-checklist",
-                    options=[],
-                    value=[],
-                    inline=False,
+                html.H4("Per-policy intervals (success rate & quality)"),
+                dash_table.DataTable(
+                    id="summary-table",
+                    columns=[],
+                    data=[],
+                    page_size=12,
+                    style_table={"overflowX": "auto"},
+                    style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
+                ),
+                html.Hr(),
+                html.H4("A/B comparison (base vs experimental)"),
+                html.Div(
+                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px", "maxWidth": "760px"},
+                    children=[
+                        html.Div(
+                            [
+                                html.Label("Policy A (base)"),
+                                dcc.Dropdown(id="policy-a-dropdown", options=[], value=None),
+                            ]
+                        ),
+                        html.Div(
+                            [
+                                html.Label("Policy B (experimental)"),
+                                dcc.Dropdown(id="policy-b-dropdown", options=[], value=None),
+                            ]
+                        ),
+                    ],
+                ),
+                html.Div(id="ab-output", style={"marginTop": "10px"}),
+                html.Div(id="ab-failure-peek", style={"marginTop": "8px"}),
+                dcc.Graph(id="ab-comparison-graph"),
+                dcc.Graph(id="ab-quality-graph"),
+                dcc.Graph(id="ab-dropin-graph"),
+                dcc.Graph(id="ab-violin-graph"),
+                html.H4("Failure mode highlights (quick sneak peek)"),
+                html.Div(
+                    id="failure-main-highlights",
                     style={
-                        "marginTop": "6px",
-                        "maxHeight": "180px",
-                        "overflowY": "auto",
+                        "background": "#fafafa",
                         "border": "1px solid #e0e0e0",
                         "borderRadius": "6px",
-                        "padding": "8px 10px",
-                        "background": "#fafafa",
-                        "columnCount": 2,
-                        "columnGap": "16px",
+                        "padding": "10px 12px",
                     },
-                    labelStyle={"display": "block", "marginBottom": "4px", "whiteSpace": "nowrap"},
+                ),
+                html.Hr(),
+                html.H4("Multi-policy comparison + compact letter display"),
+                html.Div(
+                    style={"display": "grid", "gap": "8px"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
+                            children=[
+                                html.Button("Select All", id="select-all-btn"),
+                                html.Button("Deselect All", id="deselect-all-btn"),
+                                html.Div(
+                                    style={"minWidth": "260px", "maxWidth": "360px"},
+                                    children=[
+                                        html.Label("Testing Group", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Dropdown(
+                                            id="testing-group-dropdown",
+                                            options=[],
+                                            value=None,
+                                            clearable=True,
+                                            placeholder="Select a tag",
+                                            disabled=True,
+                                        ),
+                                    ],
+                                ),
+                                html.Button("Plot Tag + Base", id="apply-testing-group-btn"),
+                                html.Button("Clear Tag Filter", id="clear-testing-group-btn"),
+                            ],
+                        ),
+                        html.Div(
+                            style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"},
+                            children=[
+                                html.Button("Original Order", id="sort-original-btn"),
+                                html.Button("Sort by Success Rate \u2193", id="sort-success-btn"),
+                                html.Button("Sort by Success Rate \u2191", id="sort-success-asc-btn"),
+                                html.Button("Sort by Quality Score [%] \u2193", id="sort-quality-btn"),
+                                html.Button("Sort by Quality Score [%] \u2191", id="sort-quality-asc-btn"),
+                                html.Button("Sort by Attempt Drop-in \u2193", id="sort-dropin-btn"),
+                                html.Button("Sort by Attempt Drop-in \u2191", id="sort-dropin-asc-btn"),
+                            ],
+                        ),
+                    ],
+                ),
+                html.Div(id="sort-status", style={"marginTop": "6px", "fontSize": "13px"}),
+                html.Div(
+                    style={"marginTop": "8px"},
+                    children=[
+                        html.Label("Policies to include", style={"fontSize": "13px", "fontWeight": "600"}),
+                        dcc.Checklist(
+                            id="policy-checklist",
+                            options=[],
+                            value=[],
+                            inline=False,
+                            style={
+                                "marginTop": "6px",
+                                "maxHeight": "180px",
+                                "overflowY": "auto",
+                                "border": "1px solid #e0e0e0",
+                                "borderRadius": "6px",
+                                "padding": "8px 10px",
+                                "background": "#fafafa",
+                                "columnCount": 2,
+                                "columnGap": "16px",
+                            },
+                            labelStyle={"display": "block", "marginBottom": "4px", "whiteSpace": "nowrap"},
+                        ),
+                    ],
+                ),
+                dcc.Checklist(
+                    id="show-final-violin-toggle",
+                    options=[{"label": "Show final base-vs-policy violin panel", "value": "show"}],
+                    value=["show"],
+                    inline=True,
+                    style={"marginTop": "8px"},
+                ),
+                dcc.Graph(id="performance-graph"),
+                dcc.Graph(id="quality-score-graph"),
+                dcc.Graph(id="dropin-ratio-graph"),
+                dcc.Graph(id="sr-vs-quality-graph"),
+                html.Div(id="final-violin-wrapper", children=[dcc.Graph(id="cld-violin-graph")]),
+                dash_table.DataTable(
+                    id="cld-table",
+                    columns=[],
+                    data=[],
+                    page_size=12,
+                    style_table={"overflowX": "auto"},
+                    style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
+                    style_data_conditional=[],
+                ),
+                html.Hr(),
+                html.H4("All-vs-all compact letter display (CLD)"),
+                html.P(
+                    "All selected policies compared pairwise (Holm-adjusted). "
+                    "Policies sharing a letter are not significantly different.",
+                    style={"fontSize": "13px", "color": "#666"},
+                ),
+                dash_table.DataTable(
+                    id="allvsall-cld-table",
+                    columns=[],
+                    data=[],
+                    page_size=20,
+                    style_table={"overflowX": "auto"},
+                    style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
+                    style_data_conditional=[],
+                ),
+                dcc.Checklist(
+                    id="show-allvsall-violin-toggle",
+                    options=[{"label": "Show all-vs-all CLD violin", "value": "show"}],
+                    value=["show"],
+                    inline=True,
+                    style={"marginTop": "8px"},
+                ),
+                html.Div(id="allvsall-violin-wrapper", children=[dcc.Graph(id="allvsall-violin-graph")]),
+            ],
+        ),
+        html.Div(
+            id="failure-page",
+            style={"display": "none"},
+            children=[
+                html.H2("Failure Mode Analysis"),
+                html.P(
+                    "Dedicated page for detailed rollout-level diagnostics. "
+                    "Load per-policy detail links, then compare failure patterns across condition grids."
+                ),
+                html.Div(
+                    style={"display": "grid", "gap": "8px"},
+                    children=[
+                        html.Div(
+                            style={"display": "flex", "gap": "8px", "alignItems": "flex-end", "flexWrap": "wrap"},
+                            children=[
+                                html.Button("Load/Refresh detailed rollout sheets", id="load-failure-details-btn"),
+                                html.Div(
+                                    style={"minWidth": "220px"},
+                                    children=[
+                                        html.Label("Metric", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Dropdown(
+                                            id="failure-metric-dropdown",
+                                            options=FAILURE_METRIC_OPTIONS,
+                                            value="failure_rate",
+                                            clearable=False,
+                                        ),
+                                    ],
+                                ),
+                                html.Div(
+                                    style={"minWidth": "280px", "flex": "1 1 320px"},
+                                    children=[
+                                        html.Label("Policies", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Dropdown(
+                                            id="failure-policy-filter",
+                                            options=[],
+                                            value=[],
+                                            multi=True,
+                                            placeholder="Select policies (default: all)",
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            style={"display": "flex", "gap": "8px", "alignItems": "flex-end", "flexWrap": "wrap"},
+                            children=[
+                                html.Div(
+                                    style={"minWidth": "260px"},
+                                    children=[
+                                        html.Label("X axis condition", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Dropdown(id="failure-x-axis-dropdown", options=[], value=None, clearable=False),
+                                    ],
+                                ),
+                                html.Div(
+                                    style={"minWidth": "260px"},
+                                    children=[
+                                        html.Label("Y axis condition", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Dropdown(id="failure-y-axis-dropdown", options=[], value=None, clearable=False),
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                html.Div(id="failure-load-status", style={"marginTop": "8px", "fontSize": "13px"}),
+                dcc.Graph(id="failure-policy-grid-graph"),
+                dcc.Graph(id="failure-aggregate-graph"),
+                html.H4("Top hardest conditions"),
+                dash_table.DataTable(
+                    id="failure-top-conditions-table",
+                    columns=[],
+                    data=[],
+                    page_size=12,
+                    style_table={"overflowX": "auto"},
+                    style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
+                ),
+                html.H4("Coverage by policy"),
+                dash_table.DataTable(
+                    id="failure-coverage-table",
+                    columns=[],
+                    data=[],
+                    page_size=20,
+                    style_table={"overflowX": "auto"},
+                    style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
                 ),
             ],
         ),
-        dcc.Checklist(
-            id="show-final-violin-toggle",
-            options=[{"label": "Show final base-vs-policy violin panel", "value": "show"}],
-            value=["show"],
-            inline=True,
-            style={"marginTop": "8px"},
-        ),
-        dcc.Graph(id="performance-graph"),
-        dcc.Graph(id="quality-score-graph"),
-        dcc.Graph(id="dropin-ratio-graph"),
-        dcc.Graph(id="sr-vs-quality-graph"),
-        html.Div(id="final-violin-wrapper", children=[dcc.Graph(id="cld-violin-graph")]),
-        dash_table.DataTable(
-            id="cld-table",
-            columns=[],
-            data=[],
-            page_size=12,
-            style_table={"overflowX": "auto"},
-            style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
-            style_data_conditional=[],
-        ),
-        html.Hr(),
-        html.H4("All-vs-all compact letter display (CLD)"),
-        html.P(
-            "All selected policies compared pairwise (Holm-adjusted). "
-            "Policies sharing a letter are not significantly different.",
-            style={"fontSize": "13px", "color": "#666"},
-        ),
-        dash_table.DataTable(
-            id="allvsall-cld-table",
-            columns=[],
-            data=[],
-            page_size=20,
-            style_table={"overflowX": "auto"},
-            style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
-            style_data_conditional=[],
-        ),
-        dcc.Checklist(
-            id="show-allvsall-violin-toggle",
-            options=[{"label": "Show all-vs-all CLD violin", "value": "show"}],
-            value=["show"],
-            inline=True,
-            style={"marginTop": "8px"},
-        ),
-        html.Div(id="allvsall-violin-wrapper", children=[dcc.Graph(id="allvsall-violin-graph")]),
     ],
 )
+
+
+@app.callback(
+    Output("main-page", "style"),
+    Output("failure-page", "style"),
+    Input("page-tabs", "value"),
+)
+def toggle_pages(active_tab: str | None):
+    if active_tab == "failure":
+        return {"display": "none"}, {"display": "block"}
+    return {"display": "block"}, {"display": "none"}
+
+
+@app.callback(
+    Output("failure-detail-store", "data"),
+    Output("failure-load-status", "children"),
+    Output("failure-policy-filter", "options"),
+    Output("failure-policy-filter", "value"),
+    Output("failure-x-axis-dropdown", "options"),
+    Output("failure-x-axis-dropdown", "value"),
+    Output("failure-y-axis-dropdown", "options"),
+    Output("failure-y-axis-dropdown", "value"),
+    Input("load-failure-details-btn", "n_clicks"),
+    State("raw-table", "data"),
+    prevent_initial_call=True,
+)
+def load_failure_detail_data(
+    _load_clicks: int,
+    rows: list[dict] | None,
+):
+    empty_store = {
+        "records": [],
+        "condition_columns": [],
+        "default_x": None,
+        "default_y": None,
+    }
+
+    if not rows:
+        return empty_store, "Load the main policy table first.", [], [], [], None, [], None
+
+    all_policy_links = _collect_policy_detail_links(rows)
+    clean_df = _raw_to_clean_df(rows)
+    if "has_success_rate_input" in clean_df.columns:
+        completed_policy_names = {
+            str(name).strip()
+            for name in clean_df.loc[clean_df["has_success_rate_input"].fillna(True), "model_name"].astype(str).tolist()
+        }
+    else:
+        completed_policy_names = {str(name).strip() for name in clean_df["model_name"].astype(str).tolist()}
+
+    policy_links = [
+        item
+        for item in all_policy_links
+        if str(item.get("policy_name", "")).strip() in completed_policy_names
+    ]
+    planning_rows_skipped = max(0, len(all_policy_links) - len(policy_links))
+
+    if not policy_links:
+        message = "No valid detail-sheet URLs found for completed policies."
+        if planning_rows_skipped > 0:
+            message += " Rows without success rate were skipped by design."
+        return (
+            empty_store,
+            message,
+            [],
+            [],
+            [],
+            None,
+            [],
+            None,
+        )
+
+    all_records: list[dict[str, object]] = []
+    condition_by_key: dict[str, str] = {}
+    policy_order: list[str] = []
+    errors: list[str] = []
+
+    for item in policy_links:
+        policy_name = str(item["policy_name"])
+        detail_url = str(item["detail_url"])
+        try:
+            detail_df = load_google_spreadsheet(detail_url, enrich_hyperlinks=False)
+            records, condition_columns = _normalize_detail_rollout_frame(
+                detail_df,
+                policy_name=policy_name,
+                detail_url=detail_url,
+            )
+        except Exception as exc:
+            errors.append(f"{policy_name}: {exc}")
+            continue
+
+        if not records:
+            errors.append(f"{policy_name}: no usable rollout rows")
+            continue
+
+        policy_order.append(policy_name)
+        all_records.extend(records)
+        for entry in condition_columns:
+            key = str(entry.get("key", "")).strip()
+            label = str(entry.get("label", "")).strip()
+            if key and label and key not in condition_by_key:
+                condition_by_key[key] = label
+
+    if not all_records:
+        message = "Could not load rollout details from any policy links."
+        if errors:
+            preview = "; ".join(errors[:2])
+            if len(errors) > 2:
+                preview += "; ..."
+            message += f" ({preview})"
+        return empty_store, message, [], [], [], None, [], None
+
+    condition_columns = [{"key": key, "label": label} for key, label in condition_by_key.items()]
+    default_x = _pick_default_condition_key(condition_columns, FAILURE_DEFAULT_X_COLUMN_CANDIDATES)
+    default_y = _pick_default_condition_key(condition_columns, FAILURE_DEFAULT_Y_COLUMN_CANDIDATES)
+    if default_x and default_y and default_x == default_y and len(condition_columns) > 1:
+        alternatives = [entry["key"] for entry in condition_columns if entry["key"] != default_x]
+        default_y = alternatives[0] if alternatives else default_y
+
+    unique_policies = list(dict.fromkeys(policy_order))
+    policy_options = [{"label": name, "value": name} for name in unique_policies]
+    axis_options = [{"label": entry["label"], "value": entry["key"]} for entry in condition_columns]
+
+    status = (
+        f"Loaded {len(all_records)} rollout rows from {len(unique_policies)} policy detail sheets. "
+        f"Detected {len(condition_columns)} condition columns."
+    )
+    if errors:
+        status += f" Skipped {len(errors)} sheet(s)."
+    if planning_rows_skipped > 0:
+        status += f" Ignored {planning_rows_skipped} planning row(s) without success rate."
+
+    store_data = {
+        "records": all_records,
+        "condition_columns": condition_columns,
+        "default_x": default_x,
+        "default_y": default_y,
+    }
+
+    return (
+        store_data,
+        status,
+        policy_options,
+        unique_policies,
+        axis_options,
+        default_x,
+        axis_options,
+        default_y,
+    )
+
+
+@app.callback(
+    Output("failure-policy-grid-graph", "figure"),
+    Output("failure-aggregate-graph", "figure"),
+    Output("failure-top-conditions-table", "data"),
+    Output("failure-top-conditions-table", "columns"),
+    Output("failure-coverage-table", "data"),
+    Output("failure-coverage-table", "columns"),
+    Output("failure-main-highlights", "children"),
+    Output("ab-failure-peek", "children"),
+    Input("failure-detail-store", "data"),
+    Input("failure-metric-dropdown", "value"),
+    Input("failure-x-axis-dropdown", "value"),
+    Input("failure-y-axis-dropdown", "value"),
+    Input("failure-policy-filter", "value"),
+    Input("policy-a-dropdown", "value"),
+    Input("policy-b-dropdown", "value"),
+)
+def update_failure_views(
+    failure_store: dict | None,
+    metric_mode: str | None,
+    x_key: str | None,
+    y_key: str | None,
+    selected_policies: list[str] | None,
+    policy_a: str | None,
+    policy_b: str | None,
+):
+    empty_message = "Load detailed rollout sheets from the Failure Mode Analysis tab to see highlights."
+    empty_ab_peek = html.Div(
+        "Failure-mode sneak peek appears here after detailed sheets are loaded.",
+        style={
+            "fontSize": "13px",
+            "color": "#555",
+            "background": "#fafafa",
+            "border": "1px solid #e0e0e0",
+            "borderRadius": "6px",
+            "padding": "8px 12px",
+        },
+    )
+
+    if not failure_store or not failure_store.get("records"):
+        return (
+            _failure_empty_figure("Load detail sheets to render policy mini-heatmaps"),
+            _failure_empty_figure("Load detail sheets to render aggregate heatmap"),
+            [],
+            [],
+            [],
+            [],
+            empty_message,
+            empty_ab_peek,
+        )
+
+    detail_df = pd.DataFrame(failure_store.get("records") or [])
+    if detail_df.empty:
+        return (
+            _failure_empty_figure("No detail rollout rows available"),
+            _failure_empty_figure("No detail rollout rows available"),
+            [],
+            [],
+            [],
+            [],
+            empty_message,
+            empty_ab_peek,
+        )
+
+    condition_columns = {
+        str(entry.get("key", "")): str(entry.get("label", ""))
+        for entry in (failure_store.get("condition_columns") or [])
+        if str(entry.get("key", "")).strip()
+    }
+    x_key = x_key if x_key in condition_columns else str(failure_store.get("default_x") or "")
+    y_key = y_key if y_key in condition_columns else str(failure_store.get("default_y") or "")
+
+    if not x_key or not y_key or x_key not in detail_df.columns or y_key not in detail_df.columns:
+        return (
+            _failure_empty_figure("Select X and Y condition columns to visualize failure modes"),
+            _failure_empty_figure("Select X and Y condition columns to visualize failure modes"),
+            [],
+            [],
+            [],
+            [],
+            "Condition axes are not available yet. Reload detail sheets and try again.",
+            empty_ab_peek,
+        )
+
+    detail_df = detail_df.copy()
+    detail_df["policy_name"] = detail_df["policy_name"].astype(str)
+    detail_df["task_success"] = pd.to_numeric(detail_df["task_success"], errors="coerce")
+    detail_df = detail_df[detail_df["task_success"].notna()].copy()
+    if detail_df.empty:
+        return (
+            _failure_empty_figure("No valid Task Success rows found in detail sheets"),
+            _failure_empty_figure("No valid Task Success rows found in detail sheets"),
+            [],
+            [],
+            [],
+            [],
+            "No valid Task Success values detected in loaded detail sheets.",
+            empty_ab_peek,
+        )
+
+    detail_df[x_key] = detail_df[x_key].fillna("NA").astype(str)
+    detail_df[y_key] = detail_df[y_key].fillna("NA").astype(str)
+    detail_df["quality_score_pct"] = pd.to_numeric(detail_df.get("quality_score_pct"), errors="coerce")
+
+    policy_order = list(dict.fromkeys(detail_df["policy_name"].tolist()))
+    selected_policies = [p for p in (selected_policies or []) if p in set(policy_order)]
+    if selected_policies:
+        detail_df = detail_df[detail_df["policy_name"].isin(selected_policies)].copy()
+        policy_order = [name for name in policy_order if name in set(selected_policies)]
+
+    if detail_df.empty:
+        return (
+            _failure_empty_figure("No detail rows for selected policies"),
+            _failure_empty_figure("No detail rows for selected policies"),
+            [],
+            [],
+            [],
+            [],
+            "No detail rows for currently selected policies.",
+            empty_ab_peek,
+        )
+
+    grouped = (
+        detail_df.groupby(["policy_name", x_key, y_key], as_index=False)
+        .agg(
+            n=("task_success", "size"),
+            success_rate=("task_success", "mean"),
+            quality_score_pct=("quality_score_pct", "mean"),
+        )
+    )
+    grouped["failure_rate"] = 1.0 - grouped["success_rate"]
+    grouped["success_rate_pct"] = grouped["success_rate"] * 100.0
+    grouped["failure_rate_pct"] = grouped["failure_rate"] * 100.0
+
+    aggregate = (
+        detail_df.groupby([x_key, y_key], as_index=False)
+        .agg(
+            n=("task_success", "size"),
+            success_rate=("task_success", "mean"),
+            quality_score_pct=("quality_score_pct", "mean"),
+            policy_count=("policy_name", "nunique"),
+        )
+    )
+    aggregate["failure_rate"] = 1.0 - aggregate["success_rate"]
+    aggregate["success_rate_pct"] = aggregate["success_rate"] * 100.0
+    aggregate["failure_rate_pct"] = aggregate["failure_rate"] * 100.0
+
+    metric_mode = metric_mode or "failure_rate"
+    if metric_mode == "success_rate":
+        metric_key = "success_rate_pct"
+        metric_label = "Success rate (%)"
+        colorscale = "Greens"
+        zmin, zmax = 0.0, 100.0
+    elif metric_mode == "quality_score":
+        metric_key = "quality_score_pct"
+        metric_label = "Quality score mean (%)"
+        colorscale = "Viridis"
+        finite_values = pd.to_numeric(grouped[metric_key], errors="coerce").dropna()
+        if finite_values.empty:
+            no_quality_msg = "Quality score column is missing in loaded detail sheets"
+            return (
+                _failure_empty_figure(no_quality_msg),
+                _failure_empty_figure(no_quality_msg),
+                [],
+                [],
+                [],
+                [],
+                no_quality_msg,
+                empty_ab_peek,
+            )
+        zmin = max(0.0, float(math.floor(finite_values.min() / 5.0) * 5.0))
+        zmax = min(100.0, float(math.ceil(finite_values.max() / 5.0) * 5.0))
+        if zmax <= zmin:
+            zmax = zmin + 1.0
+    elif metric_mode == "sample_count":
+        metric_key = "n"
+        metric_label = "Sample count (n)"
+        colorscale = "Blues"
+        zmin = 0.0
+        zmax = float(max(1.0, grouped[metric_key].max()))
+    else:
+        metric_key = "failure_rate_pct"
+        metric_label = "Failure rate (%)"
+        colorscale = "Reds"
+        zmin, zmax = 0.0, 100.0
+
+    x_values = sorted({str(v) for v in grouped[x_key].dropna().tolist()}, key=_condition_sort_key)
+    y_values = sorted({str(v) for v in grouped[y_key].dropna().tolist()}, key=_condition_sort_key)
+
+    display_map, _prefix = _make_display_names(policy_order)
+    grid_fig = _build_failure_policy_grid_figure(
+        grouped,
+        policy_order,
+        x_values,
+        y_values,
+        x_key,
+        y_key,
+        metric_key,
+        metric_label,
+        colorscale,
+        zmin,
+        zmax,
+        display_names=display_map,
+    )
+    aggregate_fig = _build_failure_aggregate_figure(
+        aggregate,
+        x_values,
+        y_values,
+        x_key,
+        y_key,
+        metric_key,
+        metric_label,
+        colorscale,
+        zmin,
+        zmax,
+    )
+
+    x_label = condition_columns.get(x_key, x_key)
+    y_label = condition_columns.get(y_key, y_key)
+
+    hardest = aggregate.sort_values(["failure_rate_pct", "n"], ascending=[False, False]).copy()
+    hardest = hardest.head(12)
+    hardest["failure_rate_pct"] = hardest["failure_rate_pct"].round(2)
+    hardest["success_rate_pct"] = hardest["success_rate_pct"].round(2)
+    hardest["quality_score_pct"] = pd.to_numeric(hardest["quality_score_pct"], errors="coerce").round(2)
+    hardest_data = hardest.rename(columns={x_key: "x_condition", y_key: "y_condition"})[
+        ["x_condition", "y_condition", "failure_rate_pct", "success_rate_pct", "quality_score_pct", "n", "policy_count"]
+    ].to_dict("records")
+    hardest_columns = [
+        {"name": x_label, "id": "x_condition"},
+        {"name": y_label, "id": "y_condition"},
+        {"name": "Failure (%)", "id": "failure_rate_pct"},
+        {"name": "Success (%)", "id": "success_rate_pct"},
+        {"name": "Quality (%)", "id": "quality_score_pct"},
+        {"name": "n", "id": "n"},
+        {"name": "Policies", "id": "policy_count"},
+    ]
+
+    expected_cells = max(1, len(x_values) * len(y_values))
+    coverage = (
+        grouped.groupby("policy_name", as_index=False)
+        .agg(observed_cells=("n", "size"), rollouts=("n", "sum"))
+        .sort_values("policy_name")
+    )
+    coverage["expected_cells"] = expected_cells
+    coverage["missing_cells"] = (coverage["expected_cells"] - coverage["observed_cells"]).clip(lower=0)
+    coverage["coverage_pct"] = (coverage["observed_cells"] / coverage["expected_cells"] * 100.0).round(2)
+    coverage["policy_name"] = coverage["policy_name"].map(lambda name: display_map.get(str(name), str(name)))
+    coverage = coverage.sort_values(["coverage_pct", "policy_name"], ascending=[True, True])
+    coverage_data = coverage.to_dict("records")
+    coverage_columns = [
+        {"name": "Policy", "id": "policy_name"},
+        {"name": "Observed Cells", "id": "observed_cells"},
+        {"name": "Expected Cells", "id": "expected_cells"},
+        {"name": "Missing Cells", "id": "missing_cells"},
+        {"name": "Coverage (%)", "id": "coverage_pct"},
+        {"name": "Rollouts", "id": "rollouts"},
+    ]
+
+    highlight_items: list[html.Li] = []
+    for _, row in hardest.head(3).iterrows():
+        highlight_items.append(
+            html.Li(
+                f"{row[y_key]} × {row[x_key]}: {row['failure_rate_pct']:.1f}% failure "
+                f"(n={int(row['n'])}, {int(row['policy_count'])} policies)"
+            )
+        )
+
+    coverage_note = ""
+    if not coverage.empty:
+        worst_row = coverage.iloc[0]
+        coverage_note = (
+            f"Lowest coverage policy: {worst_row['policy_name']} at {worst_row['coverage_pct']:.1f}% "
+            f"({int(worst_row['observed_cells'])}/{int(worst_row['expected_cells'])} cells)."
+        )
+
+    main_highlights = html.Div(
+        [
+            html.Div(
+                f"Detailed rollout data loaded: {len(detail_df)} rows, {len(policy_order)} policies. "
+                f"Grid size detected: {len(y_values)} × {len(x_values)} ({y_label} × {x_label}).",
+                style={"fontWeight": "600"},
+            ),
+            html.Ul(highlight_items, style={"marginTop": "6px", "marginBottom": "6px"}),
+            html.Div(coverage_note, style={"fontSize": "12px", "color": "#666"}),
+            html.Div(
+                "Open the Failure Mode Analysis tab for full policy mini-heatmaps and axis switching.",
+                style={"fontSize": "12px", "color": "#666", "marginTop": "4px"},
+            ),
+        ]
+    )
+
+    ab_peek = empty_ab_peek
+    if policy_a and policy_b and policy_a != policy_b:
+        pair_df = grouped[grouped["policy_name"].isin([policy_a, policy_b])].copy()
+        a_df = pair_df[pair_df["policy_name"] == policy_a][[x_key, y_key, "failure_rate_pct", "n"]].rename(
+            columns={"failure_rate_pct": "failure_a", "n": "n_a"}
+        )
+        b_df = pair_df[pair_df["policy_name"] == policy_b][[x_key, y_key, "failure_rate_pct", "n"]].rename(
+            columns={"failure_rate_pct": "failure_b", "n": "n_b"}
+        )
+        merged = a_df.merge(b_df, on=[x_key, y_key], how="inner")
+        if not merged.empty:
+            merged["delta_b_minus_a"] = merged["failure_b"] - merged["failure_a"]
+            worst_reg = merged.sort_values("delta_b_minus_a", ascending=False).iloc[0]
+            best_gain = merged.sort_values("delta_b_minus_a", ascending=True).iloc[0]
+
+            reg_text = (
+                f"Largest B regression: +{worst_reg['delta_b_minus_a']:.1f} pp failure at "
+                f"{worst_reg[y_key]} × {worst_reg[x_key]} (A n={int(worst_reg['n_a'])}, B n={int(worst_reg['n_b'])})."
+            )
+            gain_text = (
+                f"Largest B improvement: {best_gain['delta_b_minus_a']:.1f} pp failure at "
+                f"{best_gain[y_key]} × {best_gain[x_key]} (A n={int(best_gain['n_a'])}, B n={int(best_gain['n_b'])})."
+            )
+            ab_peek = html.Div(
+                [
+                    html.Div("Failure-mode sneak peek (A/B)", style={"fontWeight": "600", "marginBottom": "4px"}),
+                    html.Div(reg_text),
+                    html.Div(gain_text),
+                ],
+                style={
+                    "fontSize": "13px",
+                    "background": "#fafafa",
+                    "border": "1px solid #e0e0e0",
+                    "borderRadius": "6px",
+                    "padding": "8px 12px",
+                },
+            )
+
+    return (
+        grid_fig,
+        aggregate_fig,
+        hardest_data,
+        hardest_columns,
+        coverage_data,
+        coverage_columns,
+        main_highlights,
+        ab_peek,
+    )
 
 
 @app.callback(

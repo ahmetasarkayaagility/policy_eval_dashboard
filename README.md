@@ -7,6 +7,7 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Upload a local CSV/XLSX file (e.g., downloaded from Google Sheets).
 - Paste a Google Sheets URL and load/refresh directly in-app (no manual XLSX export needed).
 - Shows a small in-app Google auth status hint (`ready` / `needs sign-in`) near the Google URL field.
+- Supports hidden Google hyperlink cells in `Eval Details` (including `HYPERLINK(...)` formulas) and extracts them into `eval_details_url` for downstream rollout-detail analysis.
 - Choose which sheet/tab to load when an XLSX file contains multiple sheets.
 - Reuse a default Google Sheets URL via `DEFAULT_GOOGLE_SHEET_URL`.
 - Edit/log rollout rows in-app.
@@ -32,6 +33,10 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Select all / deselect all policies in the plot.
 - Cleaner multi-policy controls: selection, tag filtering, and sorting controls are grouped in wrapped rows; policy checkboxes are shown in a compact scrollable panel.
 - Keep original sheet order by default, with optional sorting by success rate, `Quality Score [%]`, or `Attempt Drop-in Ratio [%]`.
+- **Dedicated Failure Mode Analysis page/tab** with rollout-level diagnostics sourced from per-policy detail sheet links.
+- **Policy mini-heatmap grid** for fast failure-mode scanning: one heatmap per policy, dynamic X/Y condition axes, global color scaling, and metric switch (`failure`, `success`, `quality`, `n`).
+- **Main-page failure sneak peek**: compact hardest-condition highlights and A/B-specific failure-mode deltas (largest regression/improvement conditions).
+- **Coverage diagnostics**: per-policy observed-vs-expected condition-cell coverage table to spot missing test combinations quickly.
 - Auto-deselect policies that have empty values in the source success-rate column.
 - Use consistent per-policy color mapping across all plots.
 - Exclude policies with empty source success-rate values from analysis.
@@ -137,6 +142,14 @@ Optional env vars:
 2. If the source has multiple tabs, use the `Sheet` dropdown to select the tab you want to analyze.
 3. Review/edit rows in the table and continue with analysis.
 
+Failure analysis workflow:
+
+1. Open the `Failure Mode Analysis` tab.
+2. Click `Load/Refresh detailed rollout sheets`.
+3. The app reads per-policy detail URLs from `eval_details_url` / `Eval Details` and loads rollout sheets.
+  - Rows without a specified success-rate value are treated as planning rows and skipped.
+4. Choose metric and X/Y condition axes, then inspect the mini-heatmap grid + aggregate hardest-condition heatmap.
+
 For Google links, authentication is required (handled automatically as above).
 
 Note: CSV files have a single table only, so there is no sheet selection for CSV.
@@ -168,6 +181,14 @@ Optional columns:
 - `Quality Score STD [%]` — standard deviation of per-rollout quality scores. When present, the app computes t-distribution CIs for quality and runs Welch t-tests for A/B and multi-policy comparisons.
 - `Attempt to drop in Ratio [%]` — proportion of attempts where a drop-in occurred (binary Yes/No outcome). Lower is better. Values in `[0, 1]` are auto-scaled to `[0, 100]`. The count of drop-in events is back-computed as `round(ratio × trials)` and used for Wilson CIs and Newcombe-Wilson delta CIs.
 - `Testing Group` — tag/category for each policy row (e.g., `Training Hyperparams`, `Model Arch.`, `Data Mixture & Augmentation`). Values such as `Base`, `Default`, `Baseline`, or `Control` are treated as base rows for tag-group plotting.
+- `Eval Details` (or `Eval Details URL`) — link to a per-policy rollout-detail sheet. Hidden Google hyperlink labels like `Link` are supported and extracted to `eval_details_url` automatically when possible.
+
+Expected columns in rollout-detail sheets (Failure Mode Analysis tab):
+
+- `Task Success` (required) — per-rollout binary outcome (`1/0`, `true/false`, `yes/no`, etc. are accepted).
+- `Score based on rubric` (optional) — per-rollout quality score; values in `[0, 1]` are auto-scaled to `%`.
+- Condition columns (recommended): `Relative Stance Offset`, `Tote on Pallet Offset`.
+  - The failure page auto-detects condition columns and allows selecting any detected pair as X/Y axes.
 
 Accepted model-name aliases include: `Model Name`, `Model`, `Policy`, `Policy Name`.
 
