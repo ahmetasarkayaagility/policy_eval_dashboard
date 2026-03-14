@@ -1082,6 +1082,118 @@ def _build_failure_aggregate_figure(
     return fig
 
 
+def _build_failure_axis_aggregate_figure(
+    aggregate_df: pd.DataFrame,
+    axis_key: str,
+    axis_values: list[str],
+    metric_key: str,
+    metric_label: str,
+    colorscale: str,
+    zmin: float | None,
+    zmax: float | None,
+    axis_label: str,
+    row_label: str,
+    title: str,
+) -> go.Figure:
+    if aggregate_df.empty or not axis_values:
+        return _failure_empty_figure("No aggregate condition data available")
+
+    def _format_cell_label(value: float) -> str:
+        if metric_key in {"failure_rate_pct", "success_rate_pct", "quality_score_pct"}:
+            return f"{value:.1f}%"
+        if metric_key == "n":
+            return str(int(round(value)))
+        return f"{value:.2f}"
+
+    z_row: list[float] = []
+    n_row: list[float] = []
+    key_series = aggregate_df[axis_key].astype(str)
+    for axis_value in axis_values:
+        matches = aggregate_df[key_series == str(axis_value)]
+        if matches.empty:
+            z_row.append(math.nan)
+            n_row.append(0.0)
+            continue
+
+        metric_value = pd.to_numeric(matches.iloc[0][metric_key], errors="coerce")
+        sample_count = pd.to_numeric(matches.iloc[0]["n"], errors="coerce")
+        z_row.append(float(metric_value) if pd.notna(metric_value) else math.nan)
+        n_row.append(float(sample_count) if pd.notna(sample_count) else 0.0)
+
+    z = np.array([z_row], dtype=float)
+    n = np.array([n_row], dtype=float)
+
+    fig = go.Figure(
+        data=[
+            go.Heatmap(
+                x=axis_values,
+                y=[row_label],
+                z=z,
+                customdata=n,
+                colorscale=colorscale,
+                zmin=zmin,
+                zmax=zmax,
+                colorbar={"title": metric_label},
+                hovertemplate=(
+                    "%{x}<br>"
+                    + metric_label
+                    + ": %{z:.2f}<br>n: %{customdata:.0f}<extra>"
+                    + row_label
+                    + "</extra>"
+                ),
+            )
+        ]
+    )
+
+    if zmin is not None and math.isfinite(zmin):
+        zmin_eff = float(zmin)
+    else:
+        finite_min = np.nanmin(z)
+        zmin_eff = float(finite_min) if np.isfinite(finite_min) else 0.0
+    if zmax is not None and math.isfinite(zmax):
+        zmax_eff = float(zmax)
+    else:
+        finite_max = np.nanmax(z)
+        zmax_eff = float(finite_max) if np.isfinite(finite_max) else zmin_eff + 1.0
+    if zmax_eff <= zmin_eff:
+        zmax_eff = zmin_eff + 1.0
+
+    annotations: list[dict[str, object]] = []
+    for x_idx, x_value in enumerate(axis_values):
+        cell_value = z[0][x_idx]
+        if pd.isna(cell_value):
+            continue
+
+        numeric_value = float(cell_value)
+        normalized = (numeric_value - zmin_eff) / (zmax_eff - zmin_eff)
+        normalized = max(0.0, min(1.0, normalized))
+        text_color = "#FFFFFF" if normalized >= 0.58 else "#111111"
+
+        annotations.append(
+            {
+                "x": x_value,
+                "y": row_label,
+                "xref": "x",
+                "yref": "y",
+                "text": _format_cell_label(numeric_value),
+                "showarrow": False,
+                "font": {"size": 11, "color": text_color},
+            }
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis_title=axis_label,
+        yaxis_title="",
+        margin={"l": 30, "r": 30, "t": 70, "b": 50},
+        height=250,
+        annotations=annotations,
+    )
+    fig.update_xaxes(tickangle=35)
+    return fig
+
+
 app = Dash(__name__)
 app.title = "Robot Policy Evaluation Dashboard"
 
@@ -1225,7 +1337,6 @@ app.layout = html.Div(
                     ],
                 ),
                 html.Div(id="ab-output", style={"marginTop": "10px"}),
-                html.Div(id="ab-failure-peek", style={"marginTop": "8px"}),
                 dcc.Graph(id="ab-comparison-graph"),
                 dcc.Graph(id="ab-quality-graph"),
                 dcc.Graph(id="ab-dropin-graph"),
@@ -1388,6 +1499,8 @@ app.layout = html.Div(
                 ),
                 html.Div(id="failure-load-status", style={"marginTop": "8px", "fontSize": "13px"}),
                 dcc.Graph(id="failure-aggregate-graph"),
+                dcc.Graph(id="failure-stack-aggregate-graph"),
+                dcc.Graph(id="failure-robot-aggregate-graph"),
                 html.H4("Top hardest conditions"),
                 dash_table.DataTable(
                     id="failure-top-conditions-table",
@@ -1543,57 +1656,45 @@ def load_failure_detail_data(
 
 @app.callback(
     Output("failure-aggregate-graph", "figure"),
+    Output("failure-stack-aggregate-graph", "figure"),
+    Output("failure-robot-aggregate-graph", "figure"),
     Output("failure-top-conditions-table", "data"),
     Output("failure-top-conditions-table", "columns"),
     Output("failure-easiest-conditions-table", "data"),
     Output("failure-easiest-conditions-table", "columns"),
     Output("failure-main-highlights", "children"),
-    Output("ab-failure-peek", "children"),
     Input("failure-detail-store", "data"),
     Input("failure-metric-dropdown", "value"),
-    Input("policy-a-dropdown", "value"),
-    Input("policy-b-dropdown", "value"),
 )
 def update_failure_views(
     failure_store: dict | None,
     metric_mode: str | None,
-    policy_a: str | None,
-    policy_b: str | None,
 ):
     empty_message = "Load detailed rollout sheets from the Failure Mode Analysis tab to see highlights."
-    empty_ab_peek = html.Div(
-        "Failure-mode sneak peek appears here after detailed sheets are loaded.",
-        style={
-            "fontSize": "13px",
-            "color": "#555",
-            "background": "#fafafa",
-            "border": "1px solid #e0e0e0",
-            "borderRadius": "6px",
-            "padding": "8px 12px",
-        },
-    )
 
     if not failure_store or not failure_store.get("records"):
         return (
             _failure_empty_figure("Load detail sheets to render aggregate heatmap"),
+            _failure_empty_figure("Load detail sheets to render stack-condition aggregate heatmap"),
+            _failure_empty_figure("Load detail sheets to render robot-condition aggregate heatmap"),
             [],
             [],
             [],
             [],
             empty_message,
-            empty_ab_peek,
         )
 
     detail_df = pd.DataFrame(failure_store.get("records") or [])
     if detail_df.empty:
         return (
             _failure_empty_figure("No detail rollout rows available"),
+            _failure_empty_figure("No detail rollout rows available"),
+            _failure_empty_figure("No detail rollout rows available"),
             [],
             [],
             [],
             [],
             empty_message,
-            empty_ab_peek,
         )
 
     condition_columns = {
@@ -1616,12 +1717,13 @@ def update_failure_views(
     if not x_key or not y_key or x_key not in detail_df.columns or y_key not in detail_df.columns:
         return (
             _failure_empty_figure("Condition axes could not be auto-detected for failure heatmap"),
+            _failure_empty_figure("Condition axes could not be auto-detected for stack-condition summary"),
+            _failure_empty_figure("Condition axes could not be auto-detected for robot-condition summary"),
             [],
             [],
             [],
             [],
             "Condition axes are not available yet. Reload detail sheets and try again.",
-            empty_ab_peek,
         )
 
     detail_df = detail_df.copy()
@@ -1631,12 +1733,13 @@ def update_failure_views(
     if detail_df.empty:
         return (
             _failure_empty_figure("No valid Task Success rows found in detail sheets"),
+            _failure_empty_figure("No valid Task Success rows found in detail sheets"),
+            _failure_empty_figure("No valid Task Success rows found in detail sheets"),
             [],
             [],
             [],
             [],
             "No valid Task Success values detected in loaded detail sheets.",
-            empty_ab_peek,
         )
 
     detail_df[x_key] = detail_df[x_key].fillna("NA").astype(str)
@@ -1670,6 +1773,30 @@ def update_failure_views(
     aggregate["success_rate_pct"] = aggregate["success_rate"] * 100.0
     aggregate["failure_rate_pct"] = aggregate["failure_rate"] * 100.0
 
+    stack_aggregate = (
+        detail_df.groupby([y_key], as_index=False)
+        .agg(
+            n=("task_success", "size"),
+            success_rate=("task_success", "mean"),
+            quality_score_pct=("quality_score_pct", "mean"),
+        )
+    )
+    stack_aggregate["failure_rate"] = 1.0 - stack_aggregate["success_rate"]
+    stack_aggregate["success_rate_pct"] = stack_aggregate["success_rate"] * 100.0
+    stack_aggregate["failure_rate_pct"] = stack_aggregate["failure_rate"] * 100.0
+
+    robot_aggregate = (
+        detail_df.groupby([x_key], as_index=False)
+        .agg(
+            n=("task_success", "size"),
+            success_rate=("task_success", "mean"),
+            quality_score_pct=("quality_score_pct", "mean"),
+        )
+    )
+    robot_aggregate["failure_rate"] = 1.0 - robot_aggregate["success_rate"]
+    robot_aggregate["success_rate_pct"] = robot_aggregate["success_rate"] * 100.0
+    robot_aggregate["failure_rate_pct"] = robot_aggregate["failure_rate"] * 100.0
+
     metric_mode = metric_mode or "failure_rate"
     if metric_mode == "success_rate":
         metric_key = "success_rate_pct"
@@ -1685,12 +1812,13 @@ def update_failure_views(
             no_quality_msg = "Quality score column is missing in loaded detail sheets"
             return (
                 _failure_empty_figure(no_quality_msg),
+                _failure_empty_figure(no_quality_msg),
+                _failure_empty_figure(no_quality_msg),
                 [],
                 [],
                 [],
                 [],
                 no_quality_msg,
-                empty_ab_peek,
             )
         zmin = max(0.0, float(math.floor(finite_values.min() / 5.0) * 5.0))
         zmax = min(100.0, float(math.ceil(finite_values.max() / 5.0) * 5.0))
@@ -1710,6 +1838,8 @@ def update_failure_views(
 
     x_values = sorted({str(v) for v in grouped[x_key].dropna().tolist()}, key=_condition_sort_key)
     y_values = sorted({str(v) for v in grouped[y_key].dropna().tolist()}, key=_condition_sort_key)
+    stack_values = sorted({str(v) for v in stack_aggregate[y_key].dropna().tolist()}, key=_condition_sort_key)
+    robot_values = sorted({str(v) for v in robot_aggregate[x_key].dropna().tolist()}, key=_condition_sort_key)
 
     aggregate_fig = _build_failure_aggregate_figure(
         aggregate,
@@ -1726,6 +1856,33 @@ def update_failure_views(
 
     x_label = condition_columns.get(x_key, x_key)
     y_label = condition_columns.get(y_key, y_key)
+
+    stack_aggregate_fig = _build_failure_axis_aggregate_figure(
+        stack_aggregate,
+        axis_key=y_key,
+        axis_values=stack_values,
+        metric_key=metric_key,
+        metric_label=metric_label,
+        colorscale=colorscale,
+        zmin=zmin,
+        zmax=zmax,
+        axis_label=y_label,
+        row_label="All robot conditions",
+        title=f"Aggregated by {y_label} ({metric_label})",
+    )
+    robot_aggregate_fig = _build_failure_axis_aggregate_figure(
+        robot_aggregate,
+        axis_key=x_key,
+        axis_values=robot_values,
+        metric_key=metric_key,
+        metric_label=metric_label,
+        colorscale=colorscale,
+        zmin=zmin,
+        zmax=zmax,
+        axis_label=x_label,
+        row_label="All stack conditions",
+        title=f"Aggregated by {x_label} ({metric_label})",
+    )
 
     hardest = aggregate.sort_values(["failure_rate_pct", "n"], ascending=[False, False]).copy()
     hardest = hardest.head(12)
@@ -1785,58 +1942,21 @@ def update_failure_views(
             html.Div("Easiest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
             html.Ul(easiest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
             html.Div(
-                "Showing a single aggregate grayscale heatmap averaged across all completed policies.",
+                "Showing one full aggregate grid plus separate axis-aggregated grayscale summaries.",
                 style={"fontSize": "12px", "color": "#666", "marginTop": "4px"},
             ),
         ]
     )
 
-    ab_peek = empty_ab_peek
-    if policy_a and policy_b and policy_a != policy_b:
-        pair_df = grouped[grouped["policy_name"].isin([policy_a, policy_b])].copy()
-        a_df = pair_df[pair_df["policy_name"] == policy_a][[x_key, y_key, "failure_rate_pct", "n"]].rename(
-            columns={"failure_rate_pct": "failure_a", "n": "n_a"}
-        )
-        b_df = pair_df[pair_df["policy_name"] == policy_b][[x_key, y_key, "failure_rate_pct", "n"]].rename(
-            columns={"failure_rate_pct": "failure_b", "n": "n_b"}
-        )
-        merged = a_df.merge(b_df, on=[x_key, y_key], how="inner")
-        if not merged.empty:
-            merged["delta_b_minus_a"] = merged["failure_b"] - merged["failure_a"]
-            worst_reg = merged.sort_values("delta_b_minus_a", ascending=False).iloc[0]
-            best_gain = merged.sort_values("delta_b_minus_a", ascending=True).iloc[0]
-
-            reg_text = (
-                f"Largest B regression: +{worst_reg['delta_b_minus_a']:.1f} pp failure at "
-                f"{worst_reg[y_key]} × {worst_reg[x_key]} (A n={int(worst_reg['n_a'])}, B n={int(worst_reg['n_b'])})."
-            )
-            gain_text = (
-                f"Largest B improvement: {best_gain['delta_b_minus_a']:.1f} pp failure at "
-                f"{best_gain[y_key]} × {best_gain[x_key]} (A n={int(best_gain['n_a'])}, B n={int(best_gain['n_b'])})."
-            )
-            ab_peek = html.Div(
-                [
-                    html.Div("Failure-mode sneak peek (A/B)", style={"fontWeight": "600", "marginBottom": "4px"}),
-                    html.Div(reg_text),
-                    html.Div(gain_text),
-                ],
-                style={
-                    "fontSize": "13px",
-                    "background": "#fafafa",
-                    "border": "1px solid #e0e0e0",
-                    "borderRadius": "6px",
-                    "padding": "8px 12px",
-                },
-            )
-
     return (
         aggregate_fig,
+        stack_aggregate_fig,
+        robot_aggregate_fig,
         hardest_data,
         hardest_columns,
         easiest_data,
         easiest_columns,
         main_highlights,
-        ab_peek,
     )
 
 
