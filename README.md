@@ -34,7 +34,7 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Cleaner multi-policy controls: selection, tag filtering, and sorting controls are grouped in wrapped rows; policy checkboxes are shown in a compact scrollable panel.
 - Keep original sheet order by default, with optional sorting by success rate, `Quality Score [%]`, or `Attempt Drop-in Ratio [%]`.
 - **Dedicated Failure Mode Analysis page/tab** with rollout-level diagnostics sourced from per-policy detail sheet links.
-- **Single aggregate failure heatmap** for fast condition scanning: one grayscale heatmap averaged across completed policies with metric switch (`failure`, `success`, `quality`, `n`) and per-cell value labels.
+- **Single aggregate failure heatmap** for fast condition scanning: one grayscale heatmap averaged across completed policies with metric switch (`failure`, `success`, `quality`, `n`), per-cell value labels, and axes ordered by highest failure severity.
 - **Main-page failure highlights**: compact hardest/easiest condition highlights from aggregate failure analysis.
 - **Axis-aggregated condition heatmaps**: separate grayscale heatmaps for stack conditions (aggregated over robot conditions) and robot conditions (aggregated over stack conditions), with per-cell value labels and ordering by highest failure severity.
 - **Top hardest + easiest conditions** tables for quick best/worst condition lookup.
@@ -150,7 +150,7 @@ Failure analysis workflow:
 3. The app reads per-policy detail URLs from `eval_details_url` / `Eval Details` and loads rollout sheets.
   - Rows without a specified success-rate value are treated as planning rows and skipped.
 4. Choose a metric and inspect:
-  - the full aggregate grayscale condition heatmap,
+  - the full aggregate grayscale condition heatmap (axes ordered by highest failure severity),
   - stack-condition aggregate heatmap,
   - robot-condition aggregate heatmap,
   - plus hardest/easiest condition tables.

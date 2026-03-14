@@ -1836,8 +1836,33 @@ def update_failure_views(
         colorscale = "Greys"
         zmin, zmax = 0.0, 100.0
 
-    x_values = sorted({str(v) for v in grouped[x_key].dropna().tolist()}, key=_condition_sort_key)
-    y_values = sorted({str(v) for v in grouped[y_key].dropna().tolist()}, key=_condition_sort_key)
+    x_ranked = (
+        detail_df.groupby([x_key], as_index=False)
+        .agg(success_rate=("task_success", "mean"))
+    )
+    x_ranked[x_key] = x_ranked[x_key].astype(str)
+    x_ranked["failure_rate_pct"] = (1.0 - pd.to_numeric(x_ranked["success_rate"], errors="coerce")) * 100.0
+    x_ranked["condition_sort_key"] = x_ranked[x_key].map(_condition_sort_key)
+    x_ranked = x_ranked.sort_values(
+        ["failure_rate_pct", "condition_sort_key"],
+        ascending=[False, True],
+        kind="stable",
+    )
+    x_values = x_ranked[x_key].drop_duplicates().tolist()
+
+    y_ranked = (
+        detail_df.groupby([y_key], as_index=False)
+        .agg(success_rate=("task_success", "mean"))
+    )
+    y_ranked[y_key] = y_ranked[y_key].astype(str)
+    y_ranked["failure_rate_pct"] = (1.0 - pd.to_numeric(y_ranked["success_rate"], errors="coerce")) * 100.0
+    y_ranked["condition_sort_key"] = y_ranked[y_key].map(_condition_sort_key)
+    y_ranked = y_ranked.sort_values(
+        ["failure_rate_pct", "condition_sort_key"],
+        ascending=[False, True],
+        kind="stable",
+    )
+    y_values = y_ranked[y_key].drop_duplicates().tolist()
 
     stack_ranked = stack_aggregate.copy()
     stack_ranked[y_key] = stack_ranked[y_key].astype(str)
@@ -1962,7 +1987,7 @@ def update_failure_views(
             html.Div("Easiest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
             html.Ul(easiest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
             html.Div(
-                "Axis-aggregated summaries are ordered from highest to lowest failure severity.",
+                "Full and axis-aggregated summaries are ordered from highest to lowest failure severity.",
                 style={"fontSize": "12px", "color": "#666", "marginTop": "4px"},
             ),
         ]
