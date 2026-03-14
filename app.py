@@ -1838,8 +1838,28 @@ def update_failure_views(
 
     x_values = sorted({str(v) for v in grouped[x_key].dropna().tolist()}, key=_condition_sort_key)
     y_values = sorted({str(v) for v in grouped[y_key].dropna().tolist()}, key=_condition_sort_key)
-    stack_values = sorted({str(v) for v in stack_aggregate[y_key].dropna().tolist()}, key=_condition_sort_key)
-    robot_values = sorted({str(v) for v in robot_aggregate[x_key].dropna().tolist()}, key=_condition_sort_key)
+
+    stack_ranked = stack_aggregate.copy()
+    stack_ranked[y_key] = stack_ranked[y_key].astype(str)
+    stack_ranked["failure_rate_pct"] = pd.to_numeric(stack_ranked["failure_rate_pct"], errors="coerce")
+    stack_ranked["condition_sort_key"] = stack_ranked[y_key].map(_condition_sort_key)
+    stack_ranked = stack_ranked.sort_values(
+        ["failure_rate_pct", "condition_sort_key"],
+        ascending=[False, True],
+        kind="stable",
+    )
+    stack_values = stack_ranked[y_key].drop_duplicates().tolist()
+
+    robot_ranked = robot_aggregate.copy()
+    robot_ranked[x_key] = robot_ranked[x_key].astype(str)
+    robot_ranked["failure_rate_pct"] = pd.to_numeric(robot_ranked["failure_rate_pct"], errors="coerce")
+    robot_ranked["condition_sort_key"] = robot_ranked[x_key].map(_condition_sort_key)
+    robot_ranked = robot_ranked.sort_values(
+        ["failure_rate_pct", "condition_sort_key"],
+        ascending=[False, True],
+        kind="stable",
+    )
+    robot_values = robot_ranked[x_key].drop_duplicates().tolist()
 
     aggregate_fig = _build_failure_aggregate_figure(
         aggregate,
@@ -1942,7 +1962,7 @@ def update_failure_views(
             html.Div("Easiest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
             html.Ul(easiest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
             html.Div(
-                "Showing one full aggregate grid plus separate axis-aggregated grayscale summaries.",
+                "Axis-aggregated summaries are ordered from highest to lowest failure severity.",
                 style={"fontSize": "12px", "color": "#666", "marginTop": "4px"},
             ),
         ]

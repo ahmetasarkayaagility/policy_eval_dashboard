@@ -36,7 +36,7 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - **Dedicated Failure Mode Analysis page/tab** with rollout-level diagnostics sourced from per-policy detail sheet links.
 - **Single aggregate failure heatmap** for fast condition scanning: one grayscale heatmap averaged across completed policies with metric switch (`failure`, `success`, `quality`, `n`) and per-cell value labels.
 - **Main-page failure highlights**: compact hardest/easiest condition highlights from aggregate failure analysis.
-- **Axis-aggregated condition heatmaps**: separate grayscale heatmaps for stack conditions (aggregated over robot conditions) and robot conditions (aggregated over stack conditions), with per-cell value labels.
+- **Axis-aggregated condition heatmaps**: separate grayscale heatmaps for stack conditions (aggregated over robot conditions) and robot conditions (aggregated over stack conditions), with per-cell value labels and ordering by highest failure severity.
 - **Top hardest + easiest conditions** tables for quick best/worst condition lookup.
 - Auto-deselect policies that have empty values in the source success-rate column.
 - Use consistent per-policy color mapping across all plots.
