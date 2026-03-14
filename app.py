@@ -992,6 +992,13 @@ def _build_failure_aggregate_figure(
     if aggregate_df.empty:
         return _failure_empty_figure("No aggregate failure data available")
 
+    def _format_cell_label(value: float) -> str:
+        if metric_key in {"failure_rate_pct", "success_rate_pct", "quality_score_pct"}:
+            return f"{value:.1f}%"
+        if metric_key == "n":
+            return str(int(round(value)))
+        return f"{value:.2f}"
+
     z = (
         aggregate_df.pivot(index=y_key, columns=x_key, values=metric_key)
         .reindex(index=y_values, columns=x_values)
@@ -1023,12 +1030,53 @@ def _build_failure_aggregate_figure(
             )
         ]
     )
+
+    if zmin is not None and math.isfinite(zmin):
+        zmin_eff = float(zmin)
+    else:
+        zmin_eff = float(np.nanmin(z)) if np.isfinite(np.nanmin(z)) else 0.0
+    if zmax is not None and math.isfinite(zmax):
+        zmax_eff = float(zmax)
+    else:
+        zmax_eff = float(np.nanmax(z)) if np.isfinite(np.nanmax(z)) else zmin_eff + 1.0
+    if zmax_eff <= zmin_eff:
+        zmax_eff = zmin_eff + 1.0
+
+    annotations: list[dict[str, object]] = []
+    for y_idx, y_value in enumerate(y_values):
+        for x_idx, x_value in enumerate(x_values):
+            cell_value = z[y_idx][x_idx]
+            if pd.isna(cell_value):
+                continue
+
+            try:
+                numeric_value = float(cell_value)
+            except (TypeError, ValueError):
+                continue
+
+            normalized = (numeric_value - zmin_eff) / (zmax_eff - zmin_eff)
+            normalized = max(0.0, min(1.0, normalized))
+            text_color = "#FFFFFF" if normalized >= 0.58 else "#111111"
+
+            annotations.append(
+                {
+                    "x": x_value,
+                    "y": y_value,
+                    "xref": "x",
+                    "yref": "y",
+                    "text": _format_cell_label(numeric_value),
+                    "showarrow": False,
+                    "font": {"size": 11, "color": text_color},
+                }
+            )
+
     fig.update_layout(
         template="plotly_white",
-        title=f"Aggregate hardest conditions ({metric_label})",
+        title=f"Aggregate condition heatmap ({metric_label})",
         xaxis_title="Robot condition (X)",
         yaxis_title="Stack condition (Y)",
         margin={"l": 30, "r": 30, "t": 70, "b": 50},
+        annotations=annotations,
     )
     fig.update_xaxes(tickangle=35)
     return fig
@@ -1313,7 +1361,7 @@ app.layout = html.Div(
                 html.H2("Failure Mode Analysis"),
                 html.P(
                     "Dedicated page for detailed rollout-level diagnostics. "
-                    "Load per-policy detail links, then compare failure patterns across condition grids."
+                    "Load per-policy detail links, then inspect the aggregate condition grid across all completed policies."
                 ),
                 html.Div(
                     style={"display": "grid", "gap": "8px"},
@@ -1334,44 +1382,11 @@ app.layout = html.Div(
                                         ),
                                     ],
                                 ),
-                                html.Div(
-                                    style={"minWidth": "280px", "flex": "1 1 320px"},
-                                    children=[
-                                        html.Label("Policies", style={"fontSize": "12px", "marginBottom": "2px"}),
-                                        dcc.Dropdown(
-                                            id="failure-policy-filter",
-                                            options=[],
-                                            value=[],
-                                            multi=True,
-                                            placeholder="Select policies (default: all)",
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
-                        html.Div(
-                            style={"display": "flex", "gap": "8px", "alignItems": "flex-end", "flexWrap": "wrap"},
-                            children=[
-                                html.Div(
-                                    style={"minWidth": "260px"},
-                                    children=[
-                                        html.Label("X axis condition", style={"fontSize": "12px", "marginBottom": "2px"}),
-                                        dcc.Dropdown(id="failure-x-axis-dropdown", options=[], value=None, clearable=False),
-                                    ],
-                                ),
-                                html.Div(
-                                    style={"minWidth": "260px"},
-                                    children=[
-                                        html.Label("Y axis condition", style={"fontSize": "12px", "marginBottom": "2px"}),
-                                        dcc.Dropdown(id="failure-y-axis-dropdown", options=[], value=None, clearable=False),
-                                    ],
-                                ),
                             ],
                         ),
                     ],
                 ),
                 html.Div(id="failure-load-status", style={"marginTop": "8px", "fontSize": "13px"}),
-                dcc.Graph(id="failure-policy-grid-graph"),
                 dcc.Graph(id="failure-aggregate-graph"),
                 html.H4("Top hardest conditions"),
                 dash_table.DataTable(
@@ -1382,12 +1397,12 @@ app.layout = html.Div(
                     style_table={"overflowX": "auto"},
                     style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
                 ),
-                html.H4("Coverage by policy"),
+                html.H4("Top easiest conditions"),
                 dash_table.DataTable(
-                    id="failure-coverage-table",
+                    id="failure-easiest-conditions-table",
                     columns=[],
                     data=[],
-                    page_size=20,
+                    page_size=12,
                     style_table={"overflowX": "auto"},
                     style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
                 ),
@@ -1411,12 +1426,6 @@ def toggle_pages(active_tab: str | None):
 @app.callback(
     Output("failure-detail-store", "data"),
     Output("failure-load-status", "children"),
-    Output("failure-policy-filter", "options"),
-    Output("failure-policy-filter", "value"),
-    Output("failure-x-axis-dropdown", "options"),
-    Output("failure-x-axis-dropdown", "value"),
-    Output("failure-y-axis-dropdown", "options"),
-    Output("failure-y-axis-dropdown", "value"),
     Input("load-failure-details-btn", "n_clicks"),
     State("raw-table", "data"),
     prevent_initial_call=True,
@@ -1433,7 +1442,7 @@ def load_failure_detail_data(
     }
 
     if not rows:
-        return empty_store, "Load the main policy table first.", [], [], [], None, [], None
+        return empty_store, "Load the main policy table first."
 
     all_policy_links = _collect_policy_detail_links(rows)
     clean_df = _raw_to_clean_df(rows)
@@ -1456,16 +1465,7 @@ def load_failure_detail_data(
         message = "No valid detail-sheet URLs found for completed policies."
         if planning_rows_skipped > 0:
             message += " Rows without success rate were skipped by design."
-        return (
-            empty_store,
-            message,
-            [],
-            [],
-            [],
-            None,
-            [],
-            None,
-        )
+        return empty_store, message
 
     all_records: list[dict[str, object]] = []
     condition_by_key: dict[str, str] = {}
@@ -1505,7 +1505,7 @@ def load_failure_detail_data(
             if len(errors) > 2:
                 preview += "; ..."
             message += f" ({preview})"
-        return empty_store, message, [], [], [], None, [], None
+        return empty_store, message
 
     condition_columns = [{"key": key, "label": label} for key, label in condition_by_key.items()]
     default_x = _pick_default_condition_key(condition_columns, FAILURE_DEFAULT_X_COLUMN_CANDIDATES)
@@ -1513,14 +1513,15 @@ def load_failure_detail_data(
     if default_x and default_y and default_x == default_y and len(condition_columns) > 1:
         alternatives = [entry["key"] for entry in condition_columns if entry["key"] != default_x]
         default_y = alternatives[0] if alternatives else default_y
-
+    condition_label_map = {entry["key"]: entry["label"] for entry in condition_columns}
+    x_label = condition_label_map.get(str(default_x), str(default_x or "N/A"))
+    y_label = condition_label_map.get(str(default_y), str(default_y or "N/A"))
     unique_policies = list(dict.fromkeys(policy_order))
-    policy_options = [{"label": name, "value": name} for name in unique_policies]
-    axis_options = [{"label": entry["label"], "value": entry["key"]} for entry in condition_columns]
 
     status = (
         f"Loaded {len(all_records)} rollout rows from {len(unique_policies)} policy detail sheets. "
-        f"Detected {len(condition_columns)} condition columns."
+        f"Detected {len(condition_columns)} condition columns. "
+        f"Using axes: {y_label} × {x_label}."
     )
     if errors:
         status += f" Skipped {len(errors)} sheet(s)."
@@ -1537,38 +1538,25 @@ def load_failure_detail_data(
     return (
         store_data,
         status,
-        policy_options,
-        unique_policies,
-        axis_options,
-        default_x,
-        axis_options,
-        default_y,
     )
 
 
 @app.callback(
-    Output("failure-policy-grid-graph", "figure"),
     Output("failure-aggregate-graph", "figure"),
     Output("failure-top-conditions-table", "data"),
     Output("failure-top-conditions-table", "columns"),
-    Output("failure-coverage-table", "data"),
-    Output("failure-coverage-table", "columns"),
+    Output("failure-easiest-conditions-table", "data"),
+    Output("failure-easiest-conditions-table", "columns"),
     Output("failure-main-highlights", "children"),
     Output("ab-failure-peek", "children"),
     Input("failure-detail-store", "data"),
     Input("failure-metric-dropdown", "value"),
-    Input("failure-x-axis-dropdown", "value"),
-    Input("failure-y-axis-dropdown", "value"),
-    Input("failure-policy-filter", "value"),
     Input("policy-a-dropdown", "value"),
     Input("policy-b-dropdown", "value"),
 )
 def update_failure_views(
     failure_store: dict | None,
     metric_mode: str | None,
-    x_key: str | None,
-    y_key: str | None,
-    selected_policies: list[str] | None,
     policy_a: str | None,
     policy_b: str | None,
 ):
@@ -1587,7 +1575,6 @@ def update_failure_views(
 
     if not failure_store or not failure_store.get("records"):
         return (
-            _failure_empty_figure("Load detail sheets to render policy mini-heatmaps"),
             _failure_empty_figure("Load detail sheets to render aggregate heatmap"),
             [],
             [],
@@ -1600,7 +1587,6 @@ def update_failure_views(
     detail_df = pd.DataFrame(failure_store.get("records") or [])
     if detail_df.empty:
         return (
-            _failure_empty_figure("No detail rollout rows available"),
             _failure_empty_figure("No detail rollout rows available"),
             [],
             [],
@@ -1615,13 +1601,21 @@ def update_failure_views(
         for entry in (failure_store.get("condition_columns") or [])
         if str(entry.get("key", "")).strip()
     }
-    x_key = x_key if x_key in condition_columns else str(failure_store.get("default_x") or "")
-    y_key = y_key if y_key in condition_columns else str(failure_store.get("default_y") or "")
+    x_key = str(failure_store.get("default_x") or "")
+    y_key = str(failure_store.get("default_y") or "")
+    available_keys = [key for key in condition_columns if key in detail_df.columns]
+
+    if (not x_key or x_key not in detail_df.columns) and available_keys:
+        x_key = available_keys[0]
+    if (
+        (not y_key or y_key not in detail_df.columns or y_key == x_key)
+        and len(available_keys) > 1
+    ):
+        y_key = next((key for key in available_keys if key != x_key), "")
 
     if not x_key or not y_key or x_key not in detail_df.columns or y_key not in detail_df.columns:
         return (
-            _failure_empty_figure("Select X and Y condition columns to visualize failure modes"),
-            _failure_empty_figure("Select X and Y condition columns to visualize failure modes"),
+            _failure_empty_figure("Condition axes could not be auto-detected for failure heatmap"),
             [],
             [],
             [],
@@ -1637,7 +1631,6 @@ def update_failure_views(
     if detail_df.empty:
         return (
             _failure_empty_figure("No valid Task Success rows found in detail sheets"),
-            _failure_empty_figure("No valid Task Success rows found in detail sheets"),
             [],
             [],
             [],
@@ -1651,22 +1644,6 @@ def update_failure_views(
     detail_df["quality_score_pct"] = pd.to_numeric(detail_df.get("quality_score_pct"), errors="coerce")
 
     policy_order = list(dict.fromkeys(detail_df["policy_name"].tolist()))
-    selected_policies = [p for p in (selected_policies or []) if p in set(policy_order)]
-    if selected_policies:
-        detail_df = detail_df[detail_df["policy_name"].isin(selected_policies)].copy()
-        policy_order = [name for name in policy_order if name in set(selected_policies)]
-
-    if detail_df.empty:
-        return (
-            _failure_empty_figure("No detail rows for selected policies"),
-            _failure_empty_figure("No detail rows for selected policies"),
-            [],
-            [],
-            [],
-            [],
-            "No detail rows for currently selected policies.",
-            empty_ab_peek,
-        )
 
     grouped = (
         detail_df.groupby(["policy_name", x_key, y_key], as_index=False)
@@ -1697,17 +1674,16 @@ def update_failure_views(
     if metric_mode == "success_rate":
         metric_key = "success_rate_pct"
         metric_label = "Success rate (%)"
-        colorscale = "Greens"
+        colorscale = "Greys"
         zmin, zmax = 0.0, 100.0
     elif metric_mode == "quality_score":
         metric_key = "quality_score_pct"
         metric_label = "Quality score mean (%)"
-        colorscale = "Viridis"
+        colorscale = "Greys"
         finite_values = pd.to_numeric(grouped[metric_key], errors="coerce").dropna()
         if finite_values.empty:
             no_quality_msg = "Quality score column is missing in loaded detail sheets"
             return (
-                _failure_empty_figure(no_quality_msg),
                 _failure_empty_figure(no_quality_msg),
                 [],
                 [],
@@ -1723,33 +1699,18 @@ def update_failure_views(
     elif metric_mode == "sample_count":
         metric_key = "n"
         metric_label = "Sample count (n)"
-        colorscale = "Blues"
+        colorscale = "Greys"
         zmin = 0.0
         zmax = float(max(1.0, grouped[metric_key].max()))
     else:
         metric_key = "failure_rate_pct"
         metric_label = "Failure rate (%)"
-        colorscale = "Reds"
+        colorscale = "Greys"
         zmin, zmax = 0.0, 100.0
 
     x_values = sorted({str(v) for v in grouped[x_key].dropna().tolist()}, key=_condition_sort_key)
     y_values = sorted({str(v) for v in grouped[y_key].dropna().tolist()}, key=_condition_sort_key)
 
-    display_map, _prefix = _make_display_names(policy_order)
-    grid_fig = _build_failure_policy_grid_figure(
-        grouped,
-        policy_order,
-        x_values,
-        y_values,
-        x_key,
-        y_key,
-        metric_key,
-        metric_label,
-        colorscale,
-        zmin,
-        zmax,
-        display_names=display_map,
-    )
     aggregate_fig = _build_failure_aggregate_figure(
         aggregate,
         x_values,
@@ -1784,42 +1745,32 @@ def update_failure_views(
         {"name": "Policies", "id": "policy_count"},
     ]
 
-    expected_cells = max(1, len(x_values) * len(y_values))
-    coverage = (
-        grouped.groupby("policy_name", as_index=False)
-        .agg(observed_cells=("n", "size"), rollouts=("n", "sum"))
-        .sort_values("policy_name")
-    )
-    coverage["expected_cells"] = expected_cells
-    coverage["missing_cells"] = (coverage["expected_cells"] - coverage["observed_cells"]).clip(lower=0)
-    coverage["coverage_pct"] = (coverage["observed_cells"] / coverage["expected_cells"] * 100.0).round(2)
-    coverage["policy_name"] = coverage["policy_name"].map(lambda name: display_map.get(str(name), str(name)))
-    coverage = coverage.sort_values(["coverage_pct", "policy_name"], ascending=[True, True])
-    coverage_data = coverage.to_dict("records")
-    coverage_columns = [
-        {"name": "Policy", "id": "policy_name"},
-        {"name": "Observed Cells", "id": "observed_cells"},
-        {"name": "Expected Cells", "id": "expected_cells"},
-        {"name": "Missing Cells", "id": "missing_cells"},
-        {"name": "Coverage (%)", "id": "coverage_pct"},
-        {"name": "Rollouts", "id": "rollouts"},
-    ]
+    easiest = aggregate.sort_values(["failure_rate_pct", "n"], ascending=[True, False]).copy()
+    easiest = easiest.head(12)
+    easiest["failure_rate_pct"] = easiest["failure_rate_pct"].round(2)
+    easiest["success_rate_pct"] = easiest["success_rate_pct"].round(2)
+    easiest["quality_score_pct"] = pd.to_numeric(easiest["quality_score_pct"], errors="coerce").round(2)
+    easiest_data = easiest.rename(columns={x_key: "x_condition", y_key: "y_condition"})[
+        ["x_condition", "y_condition", "failure_rate_pct", "success_rate_pct", "quality_score_pct", "n", "policy_count"]
+    ].to_dict("records")
+    easiest_columns = hardest_columns
 
-    highlight_items: list[html.Li] = []
+    hardest_items: list[html.Li] = []
     for _, row in hardest.head(3).iterrows():
-        highlight_items.append(
+        hardest_items.append(
             html.Li(
                 f"{row[y_key]} × {row[x_key]}: {row['failure_rate_pct']:.1f}% failure "
                 f"(n={int(row['n'])}, {int(row['policy_count'])} policies)"
             )
         )
 
-    coverage_note = ""
-    if not coverage.empty:
-        worst_row = coverage.iloc[0]
-        coverage_note = (
-            f"Lowest coverage policy: {worst_row['policy_name']} at {worst_row['coverage_pct']:.1f}% "
-            f"({int(worst_row['observed_cells'])}/{int(worst_row['expected_cells'])} cells)."
+    easiest_items: list[html.Li] = []
+    for _, row in easiest.head(3).iterrows():
+        easiest_items.append(
+            html.Li(
+                f"{row[y_key]} × {row[x_key]}: {row['failure_rate_pct']:.1f}% failure "
+                f"(n={int(row['n'])}, {int(row['policy_count'])} policies)"
+            )
         )
 
     main_highlights = html.Div(
@@ -1829,10 +1780,12 @@ def update_failure_views(
                 f"Grid size detected: {len(y_values)} × {len(x_values)} ({y_label} × {x_label}).",
                 style={"fontWeight": "600"},
             ),
-            html.Ul(highlight_items, style={"marginTop": "6px", "marginBottom": "6px"}),
-            html.Div(coverage_note, style={"fontSize": "12px", "color": "#666"}),
+            html.Div("Hardest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
+            html.Ul(hardest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
+            html.Div("Easiest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
+            html.Ul(easiest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
             html.Div(
-                "Open the Failure Mode Analysis tab for full policy mini-heatmaps and axis switching.",
+                "Showing a single aggregate grayscale heatmap averaged across all completed policies.",
                 style={"fontSize": "12px", "color": "#666", "marginTop": "4px"},
             ),
         ]
@@ -1877,12 +1830,11 @@ def update_failure_views(
             )
 
     return (
-        grid_fig,
         aggregate_fig,
         hardest_data,
         hardest_columns,
-        coverage_data,
-        coverage_columns,
+        easiest_data,
+        easiest_columns,
         main_highlights,
         ab_peek,
     )

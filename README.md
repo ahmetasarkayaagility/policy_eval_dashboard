@@ -34,9 +34,9 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Cleaner multi-policy controls: selection, tag filtering, and sorting controls are grouped in wrapped rows; policy checkboxes are shown in a compact scrollable panel.
 - Keep original sheet order by default, with optional sorting by success rate, `Quality Score [%]`, or `Attempt Drop-in Ratio [%]`.
 - **Dedicated Failure Mode Analysis page/tab** with rollout-level diagnostics sourced from per-policy detail sheet links.
-- **Policy mini-heatmap grid** for fast failure-mode scanning: one heatmap per policy, dynamic X/Y condition axes, global color scaling, and metric switch (`failure`, `success`, `quality`, `n`).
+- **Single aggregate failure heatmap** for fast condition scanning: one grayscale heatmap averaged across completed policies with metric switch (`failure`, `success`, `quality`, `n`) and per-cell value labels.
 - **Main-page failure sneak peek**: compact hardest-condition highlights and A/B-specific failure-mode deltas (largest regression/improvement conditions).
-- **Coverage diagnostics**: per-policy observed-vs-expected condition-cell coverage table to spot missing test combinations quickly.
+- **Top hardest + easiest conditions** tables for quick best/worst condition lookup.
 - Auto-deselect policies that have empty values in the source success-rate column.
 - Use consistent per-policy color mapping across all plots.
 - Exclude policies with empty source success-rate values from analysis.
@@ -148,7 +148,7 @@ Failure analysis workflow:
 2. Click `Load/Refresh detailed rollout sheets`.
 3. The app reads per-policy detail URLs from `eval_details_url` / `Eval Details` and loads rollout sheets.
   - Rows without a specified success-rate value are treated as planning rows and skipped.
-4. Choose metric and X/Y condition axes, then inspect the mini-heatmap grid + aggregate hardest-condition heatmap.
+4. Choose a metric and inspect the single aggregate grayscale heatmap (with per-cell values) plus hardest/easiest condition tables.
 
 For Google links, authentication is required (handled automatically as above).
 
@@ -188,7 +188,7 @@ Expected columns in rollout-detail sheets (Failure Mode Analysis tab):
 - `Task Success` (required) — per-rollout binary outcome (`1/0`, `true/false`, `yes/no`, etc. are accepted).
 - `Score based on rubric` (optional) — per-rollout quality score; values in `[0, 1]` are auto-scaled to `%`.
 - Condition columns (recommended): `Relative Stance Offset`, `Tote on Pallet Offset`.
-  - The failure page auto-detects condition columns and allows selecting any detected pair as X/Y axes.
+  - The failure page auto-detects condition columns and auto-selects the primary X/Y pair for aggregate heatmap rendering.
 
 Accepted model-name aliases include: `Model Name`, `Model`, `Policy`, `Policy Name`.
 
