@@ -19,12 +19,12 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
   - Compact delta + CI summary (one line per metric)
   - Color-coded verdict per metric: **green** (better), **red** (worse), **gray** (inconclusive)
   - **Combined overall verdict** synthesizing success-rate, quality, and drop-in signals (trade-offs, agreements, mixed signals)
-  - Bar chart with Wilson CI error bars
-  - Quality-score bar chart with t-distribution CI error bars (when STD is present)
-  - Attempt drop-in ratio bar chart with Wilson CI error bars (when column is present; lower is better)
+  - Combined left-right A/B bar figure: success-rate panel + quality-score panel with shared y-axis (no intra-panel bar gaps)
+  - Separate A/B attempt drop-in ratio bar chart with Wilson CI error bars (when column is present; lower is better; no intra-bar gaps)
+  - A/B condition heatmap comparison (side-by-side) from loaded rollout-detail sheets
   - Posterior violin plot (Bayesian uncertainty)
 - Compare multiple policies with base-vs-policy pair letters.
-- **Testing Group tag filtering**: when a `Testing Group` column is present, use `Plot Tag + Base` to instantly select policies in the chosen tag plus the row tagged as `Base`/`Default`/`Baseline`/`Control`.
+- **Testing Group tag filtering**: supports single or multi-tag values per policy row and multi-select filtering in UI; `Plot Tag + Base` selects policies matching any chosen tags plus rows tagged as `Base`/`Default`/`Baseline`/`Control`.
 - **Success Rate vs Quality Score scatter plot**: each policy is a point at (SR%, Quality%) with Wilson CI horizontal bars and quality CI vertical bars, enabling quick Pareto-style comparison.
 - Visualize posterior uncertainty using Bayesian violins in a final optional panel that compares base-vs-policy pairs (`base vs candidate`) with pair letters (`a-a` / `a-b`).
 - Plot selected policy success rates with Wilson CI error bars.
@@ -34,9 +34,10 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Cleaner multi-policy controls: selection, tag filtering, and sorting controls are grouped in wrapped rows; policy checkboxes are shown in a compact scrollable panel.
 - Keep original sheet order by default, with optional sorting by success rate, `Quality Score [%]`, or `Attempt Drop-in Ratio [%]`.
 - **Dedicated Failure Mode Analysis page/tab** with rollout-level diagnostics sourced from per-policy detail sheet links.
-- **Single aggregate failure heatmap** for fast condition scanning: one grayscale heatmap averaged across completed policies with metric switch (`failure`, `success`, `quality`, `n`), per-cell value labels, and axes ordered by highest failure severity.
+- **Single aggregate failure heatmap** for fast condition scanning: one grayscale heatmap averaged across completed policies with metric switch (`failure`, `success`, `quality`, `n`), per-cell value labels, and optional ordering (`Original spreadsheet order` default, or `failure severity`).
 - **Main-page failure highlights**: compact hardest/easiest condition highlights from aggregate failure analysis.
-- **Axis-aggregated condition heatmaps**: separate grayscale heatmaps for stack conditions (aggregated over robot conditions) and robot conditions (aggregated over stack conditions), with per-cell value labels and ordering by highest failure severity.
+- **Axis-aggregated condition heatmaps**: separate grayscale heatmaps for stack conditions (aggregated over robot conditions) and robot conditions (aggregated over stack conditions), with per-cell value labels and the same optional ordering mode.
+- **Selected-policy failure comparisons**: choose two policies and render smaller side-by-side comparisons for (1) full condition grid, (2) stack-axis aggregate, and (3) robot-axis aggregate.
 - **Top hardest + easiest conditions** tables for quick best/worst condition lookup.
 - Auto-deselect policies that have empty values in the source success-rate column.
 - Use consistent per-policy color mapping across all plots.
@@ -150,9 +151,11 @@ Failure analysis workflow:
 3. The app reads per-policy detail URLs from `eval_details_url` / `Eval Details` and loads rollout sheets.
   - Rows without a specified success-rate value are treated as planning rows and skipped.
 4. Choose a metric and inspect:
-  - the full aggregate grayscale condition heatmap (axes ordered by highest failure severity),
+  - the full aggregate grayscale condition heatmap,
   - stack-condition aggregate heatmap,
   - robot-condition aggregate heatmap,
+  - optional condition ordering (`Original spreadsheet order` by default or `Sort by failure severity`),
+  - selected-policy side-by-side comparisons for all three heatmap types,
   - plus hardest/easiest condition tables.
 
 For Google links, authentication is required (handled automatically as above).
@@ -168,7 +171,7 @@ The loader is flexible about header placement:
 Under multi-policy comparison:
 
 - Use `Original Order`, `Sort by Success Rate`, `Sort by Quality Score [%]`, and `Sort by Attempt Drop-in` to control policy order.
-- If your sheet contains `Testing Group`, choose a tag and click `Plot Tag + Base` to plot that tag plus the base-tagged row.
+- If your sheet contains `Testing Group`, you can choose one or more tags and click `Plot Tag + Base` to plot matching policies plus base-tagged rows.
 - Use `Clear Tag Filter` to go back to normal manual policy selection.
 - When your source sheet has a success-rate column and some rows are empty, those policies are auto-deselected from initial plotting.
 - Quality score values in `[0, 1]` are automatically converted to percentage points `[0, 100]` for display and sorting.
@@ -185,7 +188,7 @@ Optional columns:
 - `Quality Score [%]` — mean quality score per policy (values in `[0, 1]` are auto-scaled to `[0, 100]`).
 - `Quality Score STD [%]` — standard deviation of per-rollout quality scores. When present, the app computes t-distribution CIs for quality and runs Welch t-tests for A/B and multi-policy comparisons.
 - `Attempt to drop in Ratio [%]` — proportion of attempts where a drop-in occurred (binary Yes/No outcome). Lower is better. Values in `[0, 1]` are auto-scaled to `[0, 100]`. The count of drop-in events is back-computed as `round(ratio × trials)` and used for Wilson CIs and Newcombe-Wilson delta CIs.
-- `Testing Group` — tag/category for each policy row (e.g., `Training Hyperparams`, `Model Arch.`, `Data Mixture & Augmentation`). Values such as `Base`, `Default`, `Baseline`, or `Control` are treated as base rows for tag-group plotting.
+- `Testing Group` — tag/category for each policy row (e.g., `Training Hyperparams`, `Model Arch.`, `Data Mixture & Augmentation`). Single or multiple tags per row are supported (e.g., comma/semicolon/pipe-separated). Values such as `Base`, `Default`, `Baseline`, or `Control` are treated as base rows for tag-group plotting.
 - `Eval Details` (or `Eval Details URL`) — link to a per-policy rollout-detail sheet. Hidden Google hyperlink labels like `Link` are supported and extracted to `eval_details_url` automatically when possible.
 
 Expected columns in rollout-detail sheets (Failure Mode Analysis tab):
