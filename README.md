@@ -204,3 +204,34 @@ Accepted model-name aliases include: `Model Name`, `Model`, `Policy`, `Policy Na
 - Base-vs-policy pair letters are unadjusted (matching single-comparison A/B logic).
 - Both A/B verdicts and the multi-policy comparison table use color-coding / row highlighting to surface significant differences at a glance.
 - The A/B combined verdict provides a single-glance recommendation when multiple metrics are available (e.g., "B is significantly better on success rate, quality", "Trade-off: B is better on success rate but worse on drop-in ratio").
+
+## Code organization (developer notes)
+
+- `app.py` — Dash layout/callback orchestration, chart builders, and rollout-detail shaping for failure-mode analysis.
+- `data_utils.py` — all ingestion/auth/header-detection logic plus shared parsing helpers (`find_column`, `percent_like_to_numeric`, `to_percent_points`).
+- `stats_utils.py` — statistical primitives (Wilson/Newcombe intervals, pairwise tests, CLD, Welch t-test).
+- `scripts/setup_google_auth_linux.sh` — Linux bootstrap for `.env`, auth setup, and access verification.
+
+Refactor guidelines used in this repo:
+
+- Keep parsing and column-matching helpers in `data_utils.py` and reuse them from the app layer to avoid drift.
+- Keep statistical formulas isolated in `stats_utils.py` so UI/callback code stays presentation-focused.
+- Prefer stable sort/order semantics (`kind="stable"`) in ranking displays to keep ties deterministic.
+
+## Performance notes
+
+- `stats_utils.prepare_policy_metrics` computes Wilson intervals with a lightweight loop over arrays (faster than row-wise `DataFrame.apply`).
+- Failure-mode scalar parsing avoids per-cell `pandas.Series` construction in hot paths to reduce overhead on large detail sheets.
+- Google Sheets metadata/service calls are memoized via `functools.lru_cache` where safe.
+
+## Quick developer checks
+
+```bash
+python -m py_compile app.py data_utils.py stats_utils.py
+```
+
+Optional sanity run:
+
+```bash
+uv run --python .venv/bin/python python app.py
+```
