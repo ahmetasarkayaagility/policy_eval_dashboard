@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+"""Data loading and normalization helpers for policy-evaluation dashboards.
+
+The module provides a small public surface for:
+- local/Google Sheets loading,
+- loose header detection/promoting,
+- robust column matching/parsing helpers,
+- policy-table normalization into canonical columns.
+"""
+
 import base64
 import functools
 import io
@@ -65,7 +74,11 @@ EVAL_DETAILS_URL_COLUMN_CANDIDATES = [
 ]
 
 
-def _find_column(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
+def find_column(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
+    """Return the first matching column name from *candidates*.
+
+    Matching is case-insensitive and ignores non-alphanumeric characters.
+    """
     normalized = {
         re.sub(r"[^a-z0-9]", "", str(col).lower()): str(col) for col in df.columns
     }
@@ -80,10 +93,26 @@ def _normalize_header_token(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
 
 
-def _percent_like_to_numeric(series: pd.Series) -> pd.Series:
+def percent_like_to_numeric(series: pd.Series) -> pd.Series:
+    """Parse string/percent-like values into numeric values.
+
+    Examples: ``"42%" -> 42.0``, ``"1,234" -> 1234.0``.
+    Invalid values are returned as ``NaN``.
+    """
     text = series.astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False).str.strip()
     text = text.replace({"": pd.NA, "nan": pd.NA, "none": pd.NA})
     return pd.to_numeric(text, errors="coerce")
+
+
+def to_percent_points(series: pd.Series) -> pd.Series:
+    """Convert a percent-like series to percentage points [0, 100].
+
+    Values in [0, 1] are interpreted as ratios and scaled by 100.
+    Values already in percentage-point scale are kept as-is.
+    """
+    numeric = percent_like_to_numeric(series)
+    unit_interval_mask = numeric.notna() & (numeric >= 0) & (numeric <= 1)
+    return numeric.where(~unit_interval_mask, numeric * 100.0)
 
 
 def _make_unique_columns(columns: list[str]) -> list[str]:
@@ -254,6 +283,7 @@ def _extract_url_from_value(value: object) -> str | None:
 
 
 def extract_url_from_cell_value(value: object) -> str | None:
+    """Extract a URL from plain text or ``HYPERLINK(...)`` cell values."""
     return _extract_url_from_value(value)
 
 
@@ -421,6 +451,7 @@ def _get_google_credentials(scopes: list[str]):
 
 
 def get_google_auth_status() -> dict[str, str | bool]:
+    """Return a UI-friendly auth readiness state for Google Sheets access."""
     try:
         _import_google_dependencies()
     except Exception as exc:
@@ -591,6 +622,10 @@ def _google_spreadsheet_metadata(spreadsheet_id: str) -> dict[str, object]:
 
 
 def list_google_spreadsheet_sheets(spreadsheet_url: str) -> dict[str, object]:
+    """List tabs for a Google Spreadsheet URL and pick a default tab.
+
+    Returns metadata with ``title``, ``sheets`` and ``default_sheet``.
+    """
     spreadsheet_id, preferred_gid = _parse_google_spreadsheet_url(spreadsheet_url)
     metadata = _google_spreadsheet_metadata(spreadsheet_id)
 
@@ -626,6 +661,11 @@ def load_google_spreadsheet(
     sheet_name: str | None = None,
     enrich_hyperlinks: bool = True,
 ) -> pd.DataFrame:
+    """Load one Google Sheets tab into a DataFrame.
+
+    When ``enrich_hyperlinks`` is enabled, hyperlink formulas and rich-text links
+    are resolved into URL-like cell values when available.
+    """
     spreadsheet_id, _preferred_gid = _parse_google_spreadsheet_url(spreadsheet_url)
     _google_auth, _request, _credentials, _flow, _build, HttpError = _import_google_dependencies()
     service = _google_sheets_service()
@@ -678,12 +718,14 @@ def load_google_spreadsheet(
 
 
 def promote_header_row_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    """Detect and promote an off-row header when possible."""
     if df.empty:
         return df.copy()
     return _promote_header_from_any_row_if_needed(df.copy())
 
 
 def list_local_spreadsheet_sheets(upload_contents: str, filename: str | None) -> list[str]:
+    """Return available sheet names for an uploaded CSV/XLSX payload."""
     raw_bytes = _decode_upload_contents(upload_contents)
     filename = (filename or "").lower()
 
@@ -699,6 +741,7 @@ def load_local_spreadsheet(
     filename: str | None,
     sheet_name: str | None = None,
 ) -> pd.DataFrame:
+    """Load uploaded CSV/XLSX content into a DataFrame."""
     raw_bytes = _decode_upload_contents(upload_contents)
     filename = (filename or "").lower()
 
@@ -730,24 +773,29 @@ def load_local_spreadsheet(
 
 
 def normalize_policy_dataframe(df: pd.DataFrame, default_trials: int = DEFAULT_TRIALS) -> pd.DataFrame:
+    """Normalize policy summary tables to canonical dashboard columns.
+
+    Output always includes at least ``model_name``, ``successes`` and ``trials``,
+    plus pass-through columns and extracted ``eval_details_url`` when detected.
+    """
     if df.empty:
         return pd.DataFrame(columns=["model_name", "successes", "trials"])
 
     working_df = df.copy()
 
-    model_col = _find_column(working_df, MODEL_COLUMN_CANDIDATES)
-    successes_col = _find_column(working_df, SUCCESSES_COLUMN_CANDIDATES)
-    trials_col = _find_column(working_df, TRIALS_COLUMN_CANDIDATES)
-    success_rate_col = _find_column(working_df, SUCCESS_RATE_COLUMN_CANDIDATES)
+    model_col = find_column(working_df, MODEL_COLUMN_CANDIDATES)
+    successes_col = find_column(working_df, SUCCESSES_COLUMN_CANDIDATES)
+    trials_col = find_column(working_df, TRIALS_COLUMN_CANDIDATES)
+    success_rate_col = find_column(working_df, SUCCESS_RATE_COLUMN_CANDIDATES)
 
     if model_col is None or (successes_col is None and success_rate_col is None):
         promoted_df = _promote_header_from_any_row_if_needed(working_df)
         if not promoted_df.equals(working_df):
             working_df = promoted_df
-            model_col = _find_column(working_df, MODEL_COLUMN_CANDIDATES)
-            successes_col = _find_column(working_df, SUCCESSES_COLUMN_CANDIDATES)
-            trials_col = _find_column(working_df, TRIALS_COLUMN_CANDIDATES)
-            success_rate_col = _find_column(working_df, SUCCESS_RATE_COLUMN_CANDIDATES)
+            model_col = find_column(working_df, MODEL_COLUMN_CANDIDATES)
+            successes_col = find_column(working_df, SUCCESSES_COLUMN_CANDIDATES)
+            trials_col = find_column(working_df, TRIALS_COLUMN_CANDIDATES)
+            success_rate_col = find_column(working_df, SUCCESS_RATE_COLUMN_CANDIDATES)
 
     if model_col is None:
         raise ValueError(
@@ -770,7 +818,7 @@ def normalize_policy_dataframe(df: pd.DataFrame, default_trials: int = DEFAULT_T
     if successes_col is not None:
         successes = pd.to_numeric(out[successes_col], errors="coerce")
     elif success_rate_col is not None:
-        rate = _percent_like_to_numeric(out[success_rate_col])
+        rate = percent_like_to_numeric(out[success_rate_col])
         rate = rate.where(rate <= 1.0, rate / 100.0)
         successes = (rate * out["trials"]).round()
     else:
@@ -784,8 +832,8 @@ def normalize_policy_dataframe(df: pd.DataFrame, default_trials: int = DEFAULT_T
     out = out[out["model_name"].notna()].copy()
     out = out[out["model_name"].astype(str).str.strip().astype(bool)].copy()
 
-    eval_url_col = _find_column(out, EVAL_DETAILS_URL_COLUMN_CANDIDATES)
-    eval_details_col = _find_column(out, EVAL_DETAILS_COLUMN_CANDIDATES)
+    eval_url_col = find_column(out, EVAL_DETAILS_URL_COLUMN_CANDIDATES)
+    eval_details_col = find_column(out, EVAL_DETAILS_COLUMN_CANDIDATES)
     eval_details_urls = pd.Series(pd.NA, index=out.index, dtype="object")
     if eval_url_col is not None:
         eval_details_urls = out[eval_url_col].map(_extract_url_from_value)

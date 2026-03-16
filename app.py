@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import math
 import re
@@ -15,14 +16,20 @@ from data_utils import (
     CSV_SINGLE_SHEET_NAME,
     DEFAULT_GOOGLE_SHEET_URL,
     DEFAULT_TRIALS,
+    EVAL_DETAILS_COLUMN_CANDIDATES,
+    EVAL_DETAILS_URL_COLUMN_CANDIDATES,
+    MODEL_COLUMN_CANDIDATES,
     extract_url_from_cell_value,
+    find_column as _find_column,
     get_google_auth_status,
     list_google_spreadsheet_sheets,
     list_local_spreadsheet_sheets,
     load_google_spreadsheet,
     load_local_spreadsheet,
     normalize_policy_dataframe,
+    percent_like_to_numeric as _percent_like_to_numeric,
     promote_header_row_if_needed,
+    to_percent_points as _to_percent_points,
 )
 from stats_utils import (
     base_vs_policy_letter_pairs,
@@ -132,18 +139,10 @@ FAILURE_DEFAULT_Y_COLUMN_CANDIDATES = [
     "Initial Stack Pose",
     "Pallet Offset",
 ]
-FAILURE_LINK_COLUMN_CANDIDATES = [
-    "eval_details_url",
-    "Eval Details URL",
-    "Evaluation Details URL",
-    "Detail URL",
-    "Details URL",
-    "Rollout Details URL",
-    "Eval Details",
-    "Evaluation Details",
-    "Rollout Details",
-    "Details",
-]
+FAILURE_LINK_COLUMN_CANDIDATES = list(
+    dict.fromkeys([*EVAL_DETAILS_URL_COLUMN_CANDIDATES, *EVAL_DETAILS_COLUMN_CANDIDATES])
+)
+SAFE_POLICY_NAME_COLUMN_CANDIDATES = ["model_name", *MODEL_COLUMN_CANDIDATES]
 
 
 def _default_columns() -> list[dict[str, str | bool]]:
@@ -153,30 +152,6 @@ def _default_columns() -> list[dict[str, str | bool]]:
         {"name": "trials", "id": "trials", "editable": True},
         {"name": "notes", "id": "notes", "editable": True},
     ]
-
-
-def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    normalized = {
-        re.sub(r"[^a-z0-9]", "", str(col).lower()): str(col)
-        for col in df.columns
-    }
-    for candidate in candidates:
-        key = re.sub(r"[^a-z0-9]", "", candidate.lower())
-        if key in normalized:
-            return normalized[key]
-    return None
-
-
-def _percent_like_to_numeric(series: pd.Series) -> pd.Series:
-    text = series.astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False).str.strip()
-    text = text.replace({"": pd.NA, "nan": pd.NA, "none": pd.NA})
-    return pd.to_numeric(text, errors="coerce")
-
-
-def _to_percent_points(series: pd.Series) -> pd.Series:
-    numeric = _percent_like_to_numeric(series)
-    unit_interval_mask = numeric.notna() & (numeric >= 0) & (numeric <= 1)
-    return numeric.where(~unit_interval_mask, numeric * 100.0)
 
 
 def _normalize_group_tag(value: object) -> str:
@@ -205,6 +180,7 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({red},{green},{blue},{alpha})"
 
 
+@functools.lru_cache(maxsize=1024)
 def _policy_color(policy_name: str) -> str:
     digest = hashlib.md5(policy_name.encode("utf-8")).hexdigest()
     index = int(digest[:8], 16) % len(POLICY_COLOR_PALETTE)
@@ -570,6 +546,34 @@ def _format_numeric_token(value: float) -> str:
     return f"{value:.4f}".rstrip("0").rstrip(".")
 
 
+def _coerce_scalar_float(value: object) -> float | None:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        if pd.isna(value):
+            return None
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    clean = text.replace(",", "")
+    if clean.endswith("%"):
+        clean = clean[:-1].strip()
+    if not clean:
+        return None
+
+    try:
+        return float(clean)
+    except ValueError:
+        return None
+
+
 def _normalize_header_token(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
 
@@ -680,15 +684,15 @@ def _normalize_condition_token(value: object) -> str:
         for part in raw_parts:
             if not part:
                 return text
-            parsed = pd.to_numeric(pd.Series([part]), errors="coerce").iloc[0]
-            if pd.isna(parsed):
+            parsed = _coerce_scalar_float(part)
+            if parsed is None or math.isnan(parsed):
                 return text
-            parsed_parts.append(_format_numeric_token(float(parsed)))
+            parsed_parts.append(_format_numeric_token(parsed))
         return "[" + ", ".join(parsed_parts) + "]"
 
-    parsed = pd.to_numeric(pd.Series([text]), errors="coerce").iloc[0]
-    if pd.notna(parsed):
-        return _format_numeric_token(float(parsed))
+    parsed = _coerce_scalar_float(text)
+    if parsed is not None and not math.isnan(parsed):
+        return _format_numeric_token(parsed)
 
     return text
 
@@ -702,17 +706,17 @@ def _condition_sort_key(label: str) -> tuple:
         raw_parts = [part.strip() for part in bracket_match.group(1).split(",")]
         numbers: list[float] = []
         for part in raw_parts:
-            parsed = pd.to_numeric(pd.Series([part]), errors="coerce").iloc[0]
-            if pd.isna(parsed):
+            parsed = _coerce_scalar_float(part)
+            if parsed is None or math.isnan(parsed):
                 numbers = []
                 break
-            numbers.append(float(parsed))
+            numbers.append(parsed)
         if numbers:
             return 0, len(numbers), tuple(numbers)
 
-    parsed = pd.to_numeric(pd.Series([label]), errors="coerce").iloc[0]
-    if pd.notna(parsed):
-        return 1, float(parsed)
+    parsed = _coerce_scalar_float(label)
+    if parsed is not None and not math.isnan(parsed):
+        return 1, parsed
 
     return 2, str(label).lower()
 
@@ -725,7 +729,7 @@ def _condition_key(column_name: str) -> str:
 
 
 def _safe_policy_name_from_row(row: dict[str, object]) -> str:
-    for key in ["model_name", "Model Name", "Model", "Policy", "Policy Name"]:
+    for key in SAFE_POLICY_NAME_COLUMN_CANDIDATES:
         if key in row:
             text = str(row.get(key, "")).strip()
             if text and text.lower() not in {"nan", "none"}:
@@ -789,10 +793,10 @@ def _parse_task_success_value(value: object) -> float | None:
     if text in {"0", "false", "f", "no", "n", "fail", "failed", "failure"}:
         return 0.0
 
-    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(parsed):
+    parsed = _coerce_scalar_float(value)
+    if parsed is None or not math.isfinite(parsed):
         return None
-    return 1.0 if float(parsed) > 0 else 0.0
+    return 1.0 if parsed > 0 else 0.0
 
 
 def _normalize_detail_rollout_frame(

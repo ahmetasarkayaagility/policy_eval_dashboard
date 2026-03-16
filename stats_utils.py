@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Statistical utilities for policy-performance comparison workflows.
+
+All proportion-based metrics use Wilson intervals and z-tests, while quality-score
+comparisons use Welch's t-test with confidence intervals in percentage-point scale.
+"""
+
 import itertools
 import math
 
@@ -9,12 +15,29 @@ from scipy.stats import norm, t as t_dist
 from statsmodels.stats.multitest import multipletests
 
 
+BASE_VS_POLICY_COLUMNS = [
+    "base_policy",
+    "policy",
+    "delta",
+    "p_value",
+    "p_value_adj",
+    "is_significant",
+    "pair_letters",
+]
+
+
+def _empty_base_vs_policy_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=BASE_VS_POLICY_COLUMNS)
+
+
 def z_value(confidence_level: float) -> float:
+    """Return the two-sided normal critical value for a confidence level."""
     alpha = 1.0 - confidence_level
     return norm.ppf(1.0 - alpha / 2.0)
 
 
 def wilson_interval(successes: int, trials: int, confidence_level: float = 0.95) -> tuple[float, float]:
+    """Compute Wilson score confidence interval for a binomial proportion."""
     if trials <= 0:
         return math.nan, math.nan
 
@@ -42,6 +65,11 @@ def two_proportion_p_value(
     trials_b: int,
     alternative: str = "two-sided",
 ) -> tuple[float, float]:
+    """Two-proportion z-test.
+
+    Returns ``(z_stat, p_value)`` for ``p_b - p_a`` under the selected
+    alternative hypothesis.
+    """
     if min(trials_a, trials_b) <= 0:
         return math.nan, math.nan
 
@@ -68,12 +96,14 @@ def delta_ci_newcombe_wilson(
     trials_b: int,
     confidence_level: float = 0.95,
 ) -> tuple[float, float]:
+    """Newcombe-Wilson CI for difference in two proportions ``p_b - p_a``."""
     low_a, high_a = wilson_interval(successes_a, trials_a, confidence_level)
     low_b, high_b = wilson_interval(successes_b, trials_b, confidence_level)
     return low_b - high_a, high_b - low_a
 
 
 def prepare_policy_metrics(df: pd.DataFrame, confidence_level: float) -> pd.DataFrame:
+    """Normalize per-policy counts and attach success rates with Wilson CIs."""
     out = df.copy()
     out["successes"] = pd.to_numeric(out["successes"], errors="coerce")
     out["trials"] = pd.to_numeric(out["trials"], errors="coerce")
@@ -85,16 +115,22 @@ def prepare_policy_metrics(df: pd.DataFrame, confidence_level: float) -> pd.Data
     out["successes"] = out["successes"].clip(lower=0)
 
     out["success_rate"] = out["successes"] / out["trials"]
-    intervals = out.apply(
-        lambda row: wilson_interval(int(row["successes"]), int(row["trials"]), confidence_level),
-        axis=1,
-    )
-    out["wilson_low"] = intervals.apply(lambda x: x[0])
-    out["wilson_high"] = intervals.apply(lambda x: x[1])
+    intervals = [
+        wilson_interval(int(successes), int(trials), confidence_level)
+        for successes, trials in zip(out["successes"], out["trials"])
+    ]
+    if intervals:
+        lows, highs = zip(*intervals)
+        out["wilson_low"] = lows
+        out["wilson_high"] = highs
+    else:
+        out["wilson_low"] = []
+        out["wilson_high"] = []
     return out.reset_index(drop=True)
 
 
 def pairwise_adjusted_tests(df: pd.DataFrame, method: str = "holm") -> pd.DataFrame:
+    """Run all pairwise two-proportion tests and apply multiplicity correction."""
     records: list[dict[str, float | str]] = []
     if len(df) < 2:
         return pd.DataFrame(columns=["policy_a", "policy_b", "p_value", "p_value_adj"])
@@ -141,6 +177,7 @@ def _letter_name(index: int) -> str:
 
 
 def compact_letter_display(df: pd.DataFrame, alpha: float = 0.05) -> tuple[dict[str, str], pd.DataFrame]:
+    """Generate compact-letter displays from Holm-adjusted pairwise tests."""
     if len(df) == 0:
         return {}, pd.DataFrame()
 
@@ -201,6 +238,7 @@ def base_vs_policy_letter_pairs(
     alpha: float = 0.05,
     p_adjust_method: str | None = "holm",
 ) -> pd.DataFrame:
+    """Compare one base policy against all others with optional p-value adjustment."""
     required_columns = {"model_name", "successes", "trials"}
     missing = required_columns - set(df.columns)
     if missing:
@@ -208,17 +246,7 @@ def base_vs_policy_letter_pairs(
 
     working = df.dropna(subset=["model_name", "successes", "trials"]).copy()
     if working.empty:
-        return pd.DataFrame(
-            columns=[
-                "base_policy",
-                "policy",
-                "delta",
-                "p_value",
-                "p_value_adj",
-                "is_significant",
-                "pair_letters",
-            ]
-        )
+        return _empty_base_vs_policy_frame()
 
     labels = working["model_name"].astype(str).tolist()
     if base_policy not in labels:
@@ -259,17 +287,7 @@ def base_vs_policy_letter_pairs(
         )
 
     if not raw_records:
-        return pd.DataFrame(
-            columns=[
-                "base_policy",
-                "policy",
-                "delta",
-                "p_value",
-                "p_value_adj",
-                "is_significant",
-                "pair_letters",
-            ]
-        )
+        return _empty_base_vs_policy_frame()
 
     if p_adjust_method is None or str(p_adjust_method).lower() in {"none", "raw"}:
         reject = [p < alpha for p in raw_p_values]
