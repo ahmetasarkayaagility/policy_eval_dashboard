@@ -19,10 +19,10 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
   - Compact delta + CI summary (one line per metric)
   - Color-coded verdict per metric: **green** (better), **red** (worse), **gray** (inconclusive)
   - **Combined overall verdict** synthesizing success-rate, quality, and drop-in signals (trade-offs, agreements, mixed signals)
-  - Combined left-right A/B bar figure: success-rate panel + quality-score panel with shared y-axis (no intra-panel bar gaps)
-  - Separate A/B attempt drop-in ratio bar chart with Wilson CI error bars (when column is present; lower is better; no intra-bar gaps)
-  - A/B condition heatmap comparison (side-by-side) from loaded rollout-detail sheets
-  - Posterior violin plot (Bayesian uncertainty)
+  - Four compact side-by-side A/B plots: success rate, quality score, attempt drop-in, and posterior violin
+  - A/B attempt drop-in ratio chart uses no intra-bar gaps for compactness
+  - A/B condition heatmap comparison (side-by-side) with shared Y-axis labels and red/green success coloring
+  - Posterior violin plot (Bayesian uncertainty) in compact width/height to reduce white space
 - Compare multiple policies with base-vs-policy pair letters.
 - **Testing Group tag filtering**: supports single or multi-tag values per policy row and multi-select filtering in UI; `Plot Tag + Base` selects policies matching any chosen tags plus rows tagged as `Base`/`Default`/`Baseline`/`Control`.
 - **Success Rate vs Quality Score scatter plot**: each policy is a point at (SR%, Quality%) with Wilson CI horizontal bars and quality CI vertical bars, enabling quick Pareto-style comparison.
@@ -147,8 +147,8 @@ Optional env vars:
 Failure analysis workflow:
 
 1. Open the `Failure Mode Analysis` tab.
-2. Click `Load/Refresh detailed rollout sheets`.
-3. The app reads per-policy detail URLs from `eval_details_url` / `Eval Details` and loads rollout sheets.
+2. Load/refresh spreadsheet data from the `Main Dashboard` (`Upload CSV/XLSX` or `Load/Refresh Google Sheet`).
+3. The app automatically reads per-policy detail URLs from `eval_details_url` / `Eval Details` and loads rollout sheets for failure analysis.
   - Rows without a specified success-rate value are treated as planning rows and skipped.
 4. Choose a metric and inspect:
   - the full aggregate grayscale condition heatmap,

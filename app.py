@@ -4,6 +4,7 @@ import functools
 import hashlib
 import math
 import re
+import time
 
 import numpy as np
 import pandas as pd
@@ -1002,6 +1003,7 @@ def _build_failure_policy_grid_figure(
     n_cols: int = 4,
     title: str | None = None,
     height: int | None = None,
+    share_yaxes: bool = False,
 ) -> go.Figure:
     if not policy_names:
         return _failure_empty_figure("No policies selected for failure heatmaps")
@@ -1017,6 +1019,7 @@ def _build_failure_policy_grid_figure(
         subplot_titles=subplot_titles,
         horizontal_spacing=0.04,
         vertical_spacing=0.16,
+        shared_yaxes=share_yaxes,
     )
 
     for index, policy_name in enumerate(policy_names):
@@ -1059,6 +1062,8 @@ def _build_failure_policy_grid_figure(
             col=col_idx,
         )
         fig.update_xaxes(tickangle=35, row=row_idx, col=col_idx)
+        if share_yaxes and col_idx > 1:
+            fig.update_yaxes(showticklabels=False, row=row_idx, col=col_idx)
 
     fig.update_layout(
         template="plotly_white",
@@ -1507,17 +1512,18 @@ app.layout = html.Div(
                 html.Div(
                     style={
                         "display": "grid",
-                        "gridTemplateColumns": "repeat(auto-fit, minmax(420px, 1fr))",
+                        "gridTemplateColumns": "repeat(auto-fit, minmax(280px, 1fr))",
                         "gap": "10px",
                         "alignItems": "start",
                     },
                     children=[
-                        dcc.Graph(id="ab-comparison-graph"),
-                        dcc.Graph(id="ab-dropin-graph"),
+                        dcc.Graph(id="ab-comparison-graph", style={"height": "360px"}),
+                        dcc.Graph(id="ab-quality-graph", style={"height": "360px"}),
+                        dcc.Graph(id="ab-dropin-graph", style={"height": "360px"}),
+                        dcc.Graph(id="ab-violin-graph", style={"height": "360px"}),
                     ],
                 ),
                 dcc.Graph(id="ab-failure-heatmap-graph"),
-                dcc.Graph(id="ab-violin-graph"),
                 html.H4("Failure mode highlights (quick sneak peek)"),
                 html.Div(
                     id="failure-main-highlights",
@@ -1658,7 +1664,6 @@ app.layout = html.Div(
                         html.Div(
                             style={"display": "flex", "gap": "8px", "alignItems": "flex-end", "flexWrap": "wrap"},
                             children=[
-                                html.Button("Load/Refresh detailed rollout sheets", id="load-failure-details-btn"),
                                 html.Div(
                                     style={"minWidth": "220px"},
                                     children=[
@@ -1757,12 +1762,12 @@ def toggle_pages(active_tab: str | None):
 @app.callback(
     Output("failure-detail-store", "data"),
     Output("failure-load-status", "children"),
-    Input("load-failure-details-btn", "n_clicks"),
+    Input("uploaded-file-store", "data"),
     State("raw-table", "data"),
     prevent_initial_call=True,
 )
 def load_failure_detail_data(
-    _load_clicks: int,
+    _uploaded_state: dict | None,
     rows: list[dict] | None,
 ):
     empty_store = {
@@ -1937,13 +1942,13 @@ def update_failure_views(
     selected_policy_a: str | None,
     selected_policy_b: str | None,
 ):
-    empty_message = "Load detailed rollout sheets from the Failure Mode Analysis tab to see highlights."
+    empty_message = "Load or refresh a spreadsheet from Main Dashboard to see failure-analysis highlights."
 
     def _empty_failure_result(message: str) -> tuple:
         return (
-            _failure_empty_figure("Load detail sheets to render aggregate heatmap"),
-            _failure_empty_figure("Load detail sheets to render stack-condition aggregate heatmap"),
-            _failure_empty_figure("Load detail sheets to render robot-condition aggregate heatmap"),
+            _failure_empty_figure("Load spreadsheet data to render aggregate heatmap"),
+            _failure_empty_figure("Load spreadsheet data to render stack-condition aggregate heatmap"),
+            _failure_empty_figure("Load spreadsheet data to render robot-condition aggregate heatmap"),
             _failure_empty_figure("Select two policies to compare aggregate condition heatmaps"),
             _failure_empty_figure("Select two policies to compare stack-condition heatmaps"),
             _failure_empty_figure("Select two policies to compare robot-condition heatmaps"),
@@ -2541,7 +2546,11 @@ def load_file_to_table(
         else:
             status = f"Loaded {len(normalized)} rows from {display_name} (sheet: {sheet_name})."
 
-    return normalized.to_dict("records"), columns, status, upload_state, options, sheet_name, disabled
+    upload_state_with_refresh = dict(upload_state)
+    upload_state_with_refresh["last_loaded_sheet"] = sheet_name
+    upload_state_with_refresh["failure_refresh_token"] = time.time_ns()
+
+    return normalized.to_dict("records"), columns, status, upload_state_with_refresh, options, sheet_name, disabled
 
 
 @app.callback(
@@ -2756,6 +2765,7 @@ def sync_policy_selectors(
     Output("summary-table", "columns"),
     Output("ab-output", "children"),
     Output("ab-comparison-graph", "figure"),
+    Output("ab-quality-graph", "figure"),
     Output("ab-dropin-graph", "figure"),
     Output("ab-failure-heatmap-graph", "figure"),
     Output("ab-violin-graph", "figure"),
@@ -2811,6 +2821,7 @@ def update_analysis(
             [],
             "Add policy rows to start analysis.",
             _empty_figure("Pick two policies for A/B plot"),
+            _empty_figure("No quality score data for selected A/B policies"),
             _empty_figure("No drop-in ratio data for selected A/B policies"),
             _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps"),
             _empty_figure("Pick two policies for posterior uncertainty view"),
@@ -2841,6 +2852,7 @@ def update_analysis(
             [],
             "No concluded policies available: success rate is empty for all rows.",
             _empty_figure("Pick two concluded policies for A/B plot"),
+            _empty_figure("No quality score data for selected A/B policies"),
             _empty_figure("No drop-in ratio data for selected A/B policies"),
             _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps"),
             _empty_figure("Pick two concluded policies for posterior uncertainty view"),
@@ -2936,7 +2948,7 @@ def update_analysis(
 
     ab_output = "Pick two policies to compare."
     ab_fig = _empty_figure("Pick two policies for A/B plot")
-    ab_quality_fig = go.Figure()
+    ab_quality_fig = _empty_figure("No quality score data for selected A/B policies")
     ab_dropin_fig = _empty_figure("No drop-in ratio data for selected A/B policies")
     ab_failure_heatmap_fig = _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps")
     ab_violin_fig = _empty_figure("Pick two policies for A/B posterior view")
@@ -3028,6 +3040,9 @@ def update_analysis(
             xaxis_title="Policy",
             title=f"A/B policy comparison with {int(confidence_level * 100)}% Wilson CIs{_prefix_sub}",
             yaxis_range=[0, min(105, max(5, math.ceil((ab_df["wilson_high"].max() * 100) / 5) * 5 + 5))],
+            bargap=0.0,
+            bargroupgap=0.0,
+            height=320,
         )
 
         q_better = q_worse = False
@@ -3079,6 +3094,9 @@ def update_analysis(
                 xaxis_title="Policy",
                 title="A/B quality score comparison" + (f" with {int(confidence_level * 100)}% CIs" if ab_has_qstd else "") + _prefix_sub,
                 yaxis_range=[0, min(105, max(5, math.ceil(q_max_y / 5) * 5 + 5))],
+                bargap=0.0,
+                bargroupgap=0.0,
+                height=320,
             )
 
             # Welch t-test for quality scores
@@ -3133,66 +3151,6 @@ def update_analysis(
                         },
                     )
 
-        # ── A/B combined success + quality bar chart ────────────────
-        combined_ab_fig = make_subplots(
-            rows=1,
-            cols=2,
-            shared_yaxes=True,
-            horizontal_spacing=0.16,
-            subplot_titles=("Success Rate (%)", "Quality Score (%)"),
-        )
-        for trace in ab_fig.data:
-            combined_ab_fig.add_trace(trace, row=1, col=1)
-
-        if len(ab_quality_fig.data) > 0:
-            for trace in ab_quality_fig.data:
-                combined_ab_fig.add_trace(trace, row=1, col=2)
-        else:
-            combined_ab_fig.add_annotation(
-                text="No quality score data",
-                x=0.5,
-                y=0.5,
-                xref="x2 domain",
-                yref="y2 domain",
-                showarrow=False,
-                font={"color": "#777"},
-            )
-
-        sr_max = float(ab_df["wilson_high"].max() * 100) if not ab_df.empty else 0.0
-        q_max = 0.0
-        _qvals_ab = pd.to_numeric(ab_df.get("quality_score_pct"), errors="coerce")
-        if _qvals_ab.notna().any():
-            q_max = max(q_max, float(_qvals_ab.max(skipna=True) or 0.0))
-            if "quality_score_std_pct" in ab_df.columns and pd.to_numeric(ab_df.get("quality_score_std_pct"), errors="coerce").notna().any():
-                _qci_ab = ab_df.apply(
-                    lambda row: quality_score_ci(
-                        float(row["quality_score_pct"]) if pd.notna(row.get("quality_score_pct")) else math.nan,
-                        float(row["quality_score_std_pct"]) if pd.notna(row.get("quality_score_std_pct")) else math.nan,
-                        int(row["trials"]),
-                        confidence_level,
-                    ),
-                    axis=1,
-                    result_type="expand",
-                )
-                q_max = max(q_max, float(_qci_ab[1].max(skipna=True) or 0.0))
-
-        combined_max = max(sr_max, q_max, 5.0)
-        combined_range = [0, min(105, max(5, math.ceil(combined_max / 5) * 5 + 5))]
-
-        combined_ab_fig.update_layout(
-            template="plotly_white",
-            title=f"A/B success + quality comparison with {int(confidence_level * 100)}% CIs{_prefix_sub}",
-            yaxis_title="Rate / Score (%)",
-            bargap=0.0,
-            bargroupgap=0.0,
-            showlegend=False,
-        )
-        combined_ab_fig.update_yaxes(range=combined_range, row=1, col=1)
-        combined_ab_fig.update_yaxes(range=combined_range, row=1, col=2)
-        combined_ab_fig.update_xaxes(title_text="Policy", row=1, col=1)
-        combined_ab_fig.update_xaxes(title_text="Policy", row=1, col=2)
-        ab_fig = combined_ab_fig
-
         # ── Attempt drop-in ratio A/B ──────────────────────────────────
         if "dropin_ratio_pct" in ab_df.columns and pd.to_numeric(ab_df["dropin_ratio_pct"], errors="coerce").notna().any():
             ab_di_values = pd.to_numeric(ab_df["dropin_ratio_pct"], errors="coerce")
@@ -3232,6 +3190,7 @@ def update_analysis(
                 yaxis_range=[0, min(105, max(5, math.ceil(_di_max_y_ab / 5) * 5 + 5))],
                 bargap=0.0,
                 bargroupgap=0.0,
+                height=320,
             )
 
             # Newcombe-Wilson CI for drop-in difference (lower is better)
@@ -3350,6 +3309,15 @@ def update_analysis(
             f"A/B posterior uncertainty (Bayesian){_prefix_sub}",
             display_names=display_map,
         )
+        _ab_short_names = [display_map.get(policy_a, policy_a), display_map.get(policy_b, policy_b)]
+        ab_violin_fig.update_layout(
+            height=320,
+            margin={"l": 45, "r": 20, "t": 70, "b": 45},
+            violingap=0.0,
+            violingroupgap=0.0,
+        )
+        ab_violin_fig.update_traces(width=0.9, selector={"type": "violin"})
+        ab_violin_fig.update_xaxes(categoryorder="array", categoryarray=_ab_short_names)
 
     if policy_a and policy_b and failure_store and failure_store.get("records"):
         ab_failure_df = pd.DataFrame(failure_store.get("records") or [])
@@ -3390,6 +3358,7 @@ def update_analysis(
                         )
                     )
                     ab_grouped["failure_rate"] = 1.0 - ab_grouped["success_rate"]
+                    ab_grouped["success_rate_pct"] = ab_grouped["success_rate"] * 100.0
                     ab_grouped["failure_rate_pct"] = ab_grouped["failure_rate"] * 100.0
 
                     x_values = ab_failure_df[x_key].astype(str).drop_duplicates().tolist()
@@ -3403,15 +3372,16 @@ def update_analysis(
                             y_values=y_values,
                             x_key=x_key,
                             y_key=y_key,
-                            metric_key="failure_rate_pct",
-                            metric_label="Failure rate (%)",
-                            colorscale="Greys",
+                            metric_key="success_rate_pct",
+                            metric_label="Success rate (%)",
+                            colorscale="RdYlGn",
                             zmin=0.0,
                             zmax=100.0,
                             display_names=display_map,
                             n_cols=2,
-                            title=f"A/B condition heatmap comparison (Failure rate %){_prefix_sub}",
+                            title=f"A/B condition heatmap comparison (Success rate %){_prefix_sub}",
                             height=340,
+                            share_yaxes=True,
                         )
                     else:
                         ab_failure_heatmap_fig = _failure_empty_figure(
@@ -3824,6 +3794,7 @@ def update_analysis(
         summary_columns,
         ab_output,
         ab_fig,
+        ab_quality_fig,
         ab_dropin_fig,
         ab_failure_heatmap_fig,
         ab_violin_fig,
