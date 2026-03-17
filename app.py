@@ -529,12 +529,15 @@ def _build_posterior_violin(
     fig.update_layout(
         template="plotly_white",
         violinmode="group",
+        violingap=0.0,
+        violingroupgap=0.0,
         yaxis_title="Success Rate (%)",
         xaxis_title="Policy",
         title=title,
         yaxis_range=[0, 105],
         annotations=annotations,
     )
+    fig.update_traces(width=0.95, selector={"type": "violin"})
     return fig
 
 
@@ -614,12 +617,15 @@ def _build_base_vs_pairs_violin(
     fig.update_layout(
         template="plotly_white",
         violinmode="group",
+        violingap=0.0,
+        violingroupgap=0.0,
         yaxis_title="Success Rate (%)",
         xaxis_title="Base-vs-policy pair",
         title=f"Base-vs-policy posterior uncertainty with pair letters{title_suffix}",
         yaxis_range=[0, 105],
         annotations=annotations,
     )
+    fig.update_traces(width=0.48, selector={"type": "violin"})
     return fig
 
 
@@ -1303,6 +1309,7 @@ def _build_failure_policy_axis_pair_figure(
     zmax: float | None,
     axis_label: str,
     title: str,
+    row_label: str | None = None,
     display_names: dict[str, str] | None = None,
     height: int = 240,
 ) -> go.Figure:
@@ -1310,6 +1317,7 @@ def _build_failure_policy_axis_pair_figure(
         return _failure_empty_figure("No selected policy condition data available")
 
     display = display_names or {}
+    _row_label_text = str(row_label).strip() if row_label is not None and str(row_label).strip() else None
     subplot_titles = [display.get(policy, policy) for policy in policy_names]
     fig = make_subplots(rows=1, cols=len(policy_names), subplot_titles=subplot_titles, horizontal_spacing=0.09)
 
@@ -1332,11 +1340,12 @@ def _build_failure_policy_axis_pair_figure(
         z = np.array([z_row], dtype=float)
         n = np.array([n_row], dtype=float)
         short_name = display.get(policy_name, policy_name)
+        y_row = _row_label_text or short_name
 
         fig.add_trace(
             go.Heatmap(
                 x=axis_values,
-                y=[short_name],
+                y=[y_row],
                 z=z,
                 customdata=n,
                 colorscale=colorscale,
@@ -1356,6 +1365,8 @@ def _build_failure_policy_axis_pair_figure(
             col=index + 1,
         )
         fig.update_xaxes(tickangle=35, title_text=axis_label, row=1, col=index + 1)
+        if index > 0:
+            fig.update_yaxes(showticklabels=False, row=1, col=index + 1)
 
     fig.update_layout(
         template="plotly_white",
@@ -2206,6 +2217,7 @@ def update_failure_views(
             n_cols=2,
             title=f"Selected policy comparison — aggregate condition heatmap ({metric_label})",
             height=340,
+            share_yaxes=True,
         )
 
         policy_stack_aggregate = (
@@ -2244,6 +2256,7 @@ def update_failure_views(
             zmax=zmax,
             axis_label=y_label,
             title=f"Selected policy comparison — aggregated by {y_label} ({metric_label})",
+            row_label="All robot conditions",
             display_names=policy_display_map,
             height=240,
         )
@@ -2260,6 +2273,7 @@ def update_failure_views(
             zmax=zmax,
             axis_label=x_label,
             title=f"Selected policy comparison — aggregated by {x_label} ({metric_label})",
+            row_label="All stack conditions",
             display_names=policy_display_map,
             height=240,
         )
@@ -3637,10 +3651,6 @@ def update_analysis(
         _q_vals_scatter = pd.to_numeric(plot_df.get("quality_score_pct"), errors="coerce")
         if _q_vals_scatter.notna().any():
             sr_vs_q_fig = go.Figure()
-            _mp_has_qstd = (
-                "quality_score_std_pct" in plot_df.columns
-                and pd.to_numeric(plot_df.get("quality_score_std_pct"), errors="coerce").notna().any()
-            )
             for _, _srow in plot_df.iterrows():
                 _sname = str(_srow["model_name"])
                 _sshort = display_map.get(_sname, _sname)
@@ -3649,12 +3659,6 @@ def update_analysis(
                 if not math.isfinite(_qv):
                     continue
                 _sc = policy_colors.get(_sname, "#1f77b4")
-                _ex = dict(
-                    type="data",
-                    array=[float(_srow["wilson_high"] - _srow["success_rate"]) * 100],
-                    arrayminus=[float(_srow["success_rate"] - _srow["wilson_low"]) * 100],
-                    visible=True,
-                )
                 _trace_kw: dict = dict(
                     x=[_sr],
                     y=[_qv],
@@ -3664,22 +3668,7 @@ def update_analysis(
                     textposition="top center",
                     name=_sshort,
                     showlegend=False,
-                    error_x=_ex,
                 )
-                if _mp_has_qstd and pd.notna(_srow.get("quality_score_std_pct")):
-                    _qci_lo, _qci_hi = quality_score_ci(
-                        float(_srow["quality_score_pct"]),
-                        float(_srow["quality_score_std_pct"]),
-                        int(_srow["trials"]),
-                        confidence_level,
-                    )
-                    if math.isfinite(_qci_lo) and math.isfinite(_qci_hi):
-                        _trace_kw["error_y"] = dict(
-                            type="data",
-                            array=[_qci_hi - _qv],
-                            arrayminus=[_qv - _qci_lo],
-                            visible=True,
-                        )
                 sr_vs_q_fig.add_trace(go.Scatter(**_trace_kw))
             sr_vs_q_fig.update_layout(
                 template="plotly_white",
