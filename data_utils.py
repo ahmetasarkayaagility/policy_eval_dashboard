@@ -93,6 +93,16 @@ def _normalize_header_token(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
 
 
+def _non_empty_normalized_tokens(values: Iterable[object]) -> list[str]:
+    """Normalize raw header candidates and drop empty tokens."""
+    tokens: list[str] = []
+    for value in values:
+        token = _normalize_header_token(value)
+        if token:
+            tokens.append(token)
+    return tokens
+
+
 def percent_like_to_numeric(series: pd.Series) -> pd.Series:
     """Parse string/percent-like values into numeric values.
 
@@ -158,6 +168,7 @@ def _promote_header_row(df: pd.DataFrame, header_row: int) -> pd.DataFrame:
 
 
 def _detect_header_row(df: pd.DataFrame, max_scan_rows: int = 35) -> int | None:
+    """Return the most likely header-row index when a table starts below row 0."""
     if df.empty:
         return None
 
@@ -172,7 +183,7 @@ def _detect_header_row(df: pd.DataFrame, max_scan_rows: int = 35) -> int | None:
     scan_rows = min(max_scan_rows, len(df))
     for row_index in range(scan_rows):
         row_values = df.iloc[row_index].tolist()
-        tokens = [_normalize_header_token(value) for value in row_values if _normalize_header_token(value)]
+        tokens = _non_empty_normalized_tokens(row_values)
 
         matched_groups: set[str] = set()
         for token in tokens:

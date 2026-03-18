@@ -209,6 +209,7 @@ def _merge_unique_group_tags(series: pd.Series) -> list[str]:
 
 
 def _normalize_group_selection(value: object) -> list[str]:
+    """Normalize a single/multi-select UI value into unique display-preserving tags."""
     if isinstance(value, list):
         candidates = value
     elif value is None or (isinstance(value, float) and pd.isna(value)):
@@ -228,6 +229,65 @@ def _normalize_group_selection(value: object) -> list[str]:
         out.append(text)
         seen.add(token)
     return out
+
+
+def _select_models_for_group_tags(
+    group_names: list[str],
+    base_models: list[str],
+    group_to_models: dict[str, list[str]],
+    ordered_models: list[str],
+) -> list[str]:
+    """Return models matching selected tags plus base rows, preserving source order."""
+    selected = set(base_models)
+    for group_name in group_names:
+        selected.update(group_to_models.get(group_name, []))
+    return [model for model in ordered_models if model in selected]
+
+
+def _build_testing_group_index(
+    entries: list[tuple[str, list[str], bool]],
+) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    """Build ordered testing-group index: tags, tag→models map, and base models."""
+    tag_order: list[str] = []
+    group_to_models: dict[str, list[str]] = {}
+    base_models: list[str] = []
+    base_seen: set[str] = set()
+
+    for model_name, tags, row_is_base in entries:
+        if row_is_base and model_name not in base_seen:
+            base_models.append(model_name)
+            base_seen.add(model_name)
+
+        for tag in tags:
+            if _is_base_group_tag(tag):
+                continue
+            if tag not in group_to_models:
+                group_to_models[tag] = []
+                tag_order.append(tag)
+            if model_name not in group_to_models[tag]:
+                group_to_models[tag].append(model_name)
+
+    return tag_order, group_to_models, base_models
+
+
+def _resolve_group_dropdown_state(
+    trigger: str,
+    selected_groups: list[str],
+    active_groups: list[str],
+    tag_options: list[dict[str, str]],
+    clear_trigger_id: str,
+) -> tuple[list[str], bool, list[str]]:
+    """Resolve testing-group dropdown value/disabled state and active-group reset rules."""
+    dropdown_disabled = len(tag_options) == 0
+    if dropdown_disabled:
+        return [], True, []
+    if trigger == clear_trigger_id:
+        return [], False, active_groups
+    if selected_groups:
+        return selected_groups, False, active_groups
+    if active_groups:
+        return active_groups, False, active_groups
+    return [], False, active_groups
 
 
 def _first_non_null(series: pd.Series) -> object:
@@ -260,6 +320,7 @@ def _policy_color_map(policy_names: list[str]) -> dict[str, str]:
 
 
 def _raw_to_clean_df(raw_records: list[dict] | None) -> pd.DataFrame:
+    """Coerce raw table rows into canonical policy metrics used by all dashboards."""
     if not raw_records:
         return pd.DataFrame(
             columns=[
@@ -1194,6 +1255,357 @@ def _failure_empty_figure(message: str) -> go.Figure:
     return fig
 
 
+def _format_failure_metric_cell_label(metric_key: str, value: float) -> str:
+    """Format heatmap cell text consistently across failure-analysis plots."""
+    if metric_key in {"failure_rate_pct", "success_rate_pct", "quality_score_pct"}:
+        return f"{value:.1f}%"
+    if metric_key == "n":
+        return str(int(round(value)))
+    return f"{value:.2f}"
+
+
+def _resolve_failure_heatmap_bounds(
+    z: np.ndarray,
+    zmin: float | None,
+    zmax: float | None,
+) -> tuple[float, float]:
+    """Resolve stable finite z-bounds for failure heatmaps."""
+    finite_values = np.asarray(z, dtype=float)
+    finite_values = finite_values[np.isfinite(finite_values)]
+
+    if zmin is not None and math.isfinite(zmin):
+        zmin_eff = float(zmin)
+    else:
+        zmin_eff = float(finite_values.min()) if finite_values.size else 0.0
+
+    if zmax is not None and math.isfinite(zmax):
+        zmax_eff = float(zmax)
+    else:
+        zmax_eff = float(finite_values.max()) if finite_values.size else zmin_eff + 1.0
+
+    if zmax_eff <= zmin_eff:
+        zmax_eff = zmin_eff + 1.0
+
+    return zmin_eff, zmax_eff
+
+
+def _with_failure_rate_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Attach failure-rate convenience columns used by failure-analysis visualizations."""
+    out = frame.copy()
+    out["failure_rate"] = 1.0 - out["success_rate"]
+    out["success_rate_pct"] = out["success_rate"] * 100.0
+    out["failure_rate_pct"] = out["failure_rate"] * 100.0
+    return out
+
+
+def _empty_failure_view_result(message: str) -> tuple:
+    """Return the standard empty-state payload for failure-analysis outputs."""
+    return (
+        _failure_empty_figure("Load spreadsheet data to render aggregate heatmap"),
+        _failure_empty_figure("Load spreadsheet data to render stack-condition aggregate heatmap"),
+        _failure_empty_figure("Load spreadsheet data to render robot-condition aggregate heatmap"),
+        _failure_empty_figure("Select two policies to compare aggregate condition heatmaps"),
+        _failure_empty_figure("Select two policies to compare stack-condition heatmaps"),
+        _failure_empty_figure("Select two policies to compare robot-condition heatmaps"),
+        [],
+        [],
+        [],
+        [],
+        message,
+    )
+
+
+def _resolve_failure_axes(
+    detail_df: pd.DataFrame,
+    condition_columns: dict[str, str],
+    default_x: str | None,
+    default_y: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve valid X/Y condition keys from defaults and available columns."""
+    x_key = str(default_x or "")
+    y_key = str(default_y or "")
+    available_keys = [key for key in condition_columns if key in detail_df.columns]
+
+    if (not x_key or x_key not in detail_df.columns) and available_keys:
+        x_key = available_keys[0]
+    if (not y_key or y_key not in detail_df.columns or y_key == x_key) and len(available_keys) > 1:
+        y_key = next((key for key in available_keys if key != x_key), "")
+
+    if not x_key or not y_key or x_key not in detail_df.columns or y_key not in detail_df.columns:
+        return None, None
+    return x_key, y_key
+
+
+def _filter_failure_policy_selection(
+    detail_df: pd.DataFrame,
+    selected_failure_policies: list[str] | None,
+) -> tuple[pd.DataFrame, list[str], str | None]:
+    """Filter rollout-detail rows to selected policies and preserve source order."""
+    policy_order = list(dict.fromkeys(detail_df["policy_name"].tolist()))
+    policy_name_set = set(policy_order)
+
+    if selected_failure_policies is None:
+        selected_policy_set = set(policy_order)
+    else:
+        normalized_selection = [str(name).strip() for name in (selected_failure_policies or []) if str(name).strip()]
+        if not normalized_selection:
+            return detail_df.iloc[0:0].copy(), [], "No policies selected for failure aggregation."
+
+        selected_policy_set = {name for name in normalized_selection if name in policy_name_set}
+        if not selected_policy_set:
+            return detail_df.iloc[0:0].copy(), [], "Selected failure policies have no rollout-detail rows."
+
+    filtered_df = detail_df[detail_df["policy_name"].isin(selected_policy_set)].copy()
+    if filtered_df.empty:
+        return filtered_df, [], "No rollout-detail rows available for selected failure policies."
+
+    filtered_policy_order = [name for name in policy_order if name in selected_policy_set]
+    return filtered_df, filtered_policy_order, None
+
+
+def _aggregate_failure_frames(
+    detail_df: pd.DataFrame,
+    x_key: str,
+    y_key: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build grouped and aggregate frames used by failure-analysis visualizations."""
+    grouped = _with_failure_rate_columns(
+        detail_df.groupby(["policy_name", x_key, y_key], as_index=False)
+        .agg(
+            n=("task_success", "size"),
+            success_rate=("task_success", "mean"),
+            quality_score_pct=("quality_score_pct", "mean"),
+        )
+    )
+
+    aggregate = _with_failure_rate_columns(
+        detail_df.groupby([x_key, y_key], as_index=False)
+        .agg(
+            n=("task_success", "size"),
+            success_rate=("task_success", "mean"),
+            quality_score_pct=("quality_score_pct", "mean"),
+            policy_count=("policy_name", "nunique"),
+        )
+    )
+
+    stack_aggregate = _with_failure_rate_columns(
+        detail_df.groupby([y_key], as_index=False)
+        .agg(
+            n=("task_success", "size"),
+            success_rate=("task_success", "mean"),
+            quality_score_pct=("quality_score_pct", "mean"),
+        )
+    )
+
+    robot_aggregate = _with_failure_rate_columns(
+        detail_df.groupby([x_key], as_index=False)
+        .agg(
+            n=("task_success", "size"),
+            success_rate=("task_success", "mean"),
+            quality_score_pct=("quality_score_pct", "mean"),
+        )
+    )
+
+    return grouped, aggregate, stack_aggregate, robot_aggregate
+
+
+def _resolve_failure_metric_settings(
+    metric_mode: str | None,
+    grouped: pd.DataFrame,
+) -> tuple[str, str, str, float, float, str | None]:
+    """Resolve metric key/label/colors and z-range for failure heatmaps."""
+    mode = metric_mode or "failure_rate"
+    if mode == "success_rate":
+        return "success_rate_pct", "Success rate (%)", "Greys", 0.0, 100.0, None
+
+    if mode == "quality_score":
+        metric_key = "quality_score_pct"
+        finite_values = pd.to_numeric(grouped[metric_key], errors="coerce").dropna()
+        if finite_values.empty:
+            return "", "", "Greys", 0.0, 1.0, "Quality score column is missing in loaded detail sheets"
+        zmin = max(0.0, float(math.floor(finite_values.min() / 5.0) * 5.0))
+        zmax = min(100.0, float(math.ceil(finite_values.max() / 5.0) * 5.0))
+        if zmax <= zmin:
+            zmax = zmin + 1.0
+        return metric_key, "Quality score mean (%)", "Greys", zmin, zmax, None
+
+    if mode == "sample_count":
+        metric_key = "n"
+        zmax = float(max(1.0, grouped[metric_key].max()))
+        return metric_key, "Sample count (n)", "Greys", 0.0, zmax, None
+
+    return "failure_rate_pct", "Failure rate (%)", "Greys", 0.0, 100.0, None
+
+
+def _resolve_failure_condition_axis_values(
+    detail_df: pd.DataFrame,
+    stack_aggregate: pd.DataFrame,
+    robot_aggregate: pd.DataFrame,
+    x_key: str,
+    y_key: str,
+    condition_order_mode: str | None,
+) -> tuple[str, list[str], list[str], list[str], list[str]]:
+    """Resolve axis ordering for aggregate and axis-level failure heatmaps."""
+    mode = condition_order_mode or "original"
+    if mode == "failure":
+        x_ranked = (
+            detail_df.groupby([x_key], as_index=False)
+            .agg(success_rate=("task_success", "mean"))
+        )
+        x_ranked[x_key] = x_ranked[x_key].astype(str)
+        x_ranked["failure_rate_pct"] = (1.0 - pd.to_numeric(x_ranked["success_rate"], errors="coerce")) * 100.0
+        x_ranked["condition_sort_key"] = x_ranked[x_key].map(_condition_sort_key)
+        x_ranked = x_ranked.sort_values(
+            ["failure_rate_pct", "condition_sort_key"],
+            ascending=[False, True],
+            kind="stable",
+        )
+        x_values = x_ranked[x_key].drop_duplicates().tolist()
+
+        y_ranked = (
+            detail_df.groupby([y_key], as_index=False)
+            .agg(success_rate=("task_success", "mean"))
+        )
+        y_ranked[y_key] = y_ranked[y_key].astype(str)
+        y_ranked["failure_rate_pct"] = (1.0 - pd.to_numeric(y_ranked["success_rate"], errors="coerce")) * 100.0
+        y_ranked["condition_sort_key"] = y_ranked[y_key].map(_condition_sort_key)
+        y_ranked = y_ranked.sort_values(
+            ["failure_rate_pct", "condition_sort_key"],
+            ascending=[False, True],
+            kind="stable",
+        )
+        y_values = y_ranked[y_key].drop_duplicates().tolist()
+
+        stack_ranked = stack_aggregate.copy()
+        stack_ranked[y_key] = stack_ranked[y_key].astype(str)
+        stack_ranked["failure_rate_pct"] = pd.to_numeric(stack_ranked["failure_rate_pct"], errors="coerce")
+        stack_ranked["condition_sort_key"] = stack_ranked[y_key].map(_condition_sort_key)
+        stack_ranked = stack_ranked.sort_values(
+            ["failure_rate_pct", "condition_sort_key"],
+            ascending=[False, True],
+            kind="stable",
+        )
+        stack_values = stack_ranked[y_key].drop_duplicates().tolist()
+
+        robot_ranked = robot_aggregate.copy()
+        robot_ranked[x_key] = robot_ranked[x_key].astype(str)
+        robot_ranked["failure_rate_pct"] = pd.to_numeric(robot_ranked["failure_rate_pct"], errors="coerce")
+        robot_ranked["condition_sort_key"] = robot_ranked[x_key].map(_condition_sort_key)
+        robot_ranked = robot_ranked.sort_values(
+            ["failure_rate_pct", "condition_sort_key"],
+            ascending=[False, True],
+            kind="stable",
+        )
+        robot_values = robot_ranked[x_key].drop_duplicates().tolist()
+        return mode, x_values, y_values, stack_values, robot_values
+
+    x_values = detail_df[x_key].astype(str).drop_duplicates().tolist()
+    y_values = detail_df[y_key].astype(str).drop_duplicates().tolist()
+    return mode, x_values, y_values, y_values.copy(), x_values.copy()
+
+
+def _select_failure_policy_pair(
+    policy_order: list[str],
+    selected_policy_a: str | None,
+    selected_policy_b: str | None,
+) -> list[str]:
+    """Select up to two distinct policies for side-by-side failure comparisons."""
+    selected_pair: list[str] = []
+    for candidate in [selected_policy_a, selected_policy_b]:
+        text = str(candidate).strip() if candidate is not None else ""
+        if text and text in policy_order and text not in selected_pair:
+            selected_pair.append(text)
+    if len(selected_pair) < 2:
+        selected_pair = policy_order[:2]
+    return selected_pair[:2]
+
+
+def _failure_condition_table_columns(x_label: str, y_label: str) -> list[dict[str, str]]:
+    """Build column metadata for hardest/easiest failure condition tables."""
+    return [
+        {"name": x_label, "id": "x_condition"},
+        {"name": y_label, "id": "y_condition"},
+        {"name": "Failure (%)", "id": "failure_rate_pct"},
+        {"name": "Success (%)", "id": "success_rate_pct"},
+        {"name": "Quality (%)", "id": "quality_score_pct"},
+        {"name": "n", "id": "n"},
+        {"name": "Policies", "id": "policy_count"},
+    ]
+
+
+def _build_failure_condition_table(
+    aggregate: pd.DataFrame,
+    x_key: str,
+    y_key: str,
+    x_label: str,
+    y_label: str,
+    ascending_failure: bool,
+) -> tuple[list[dict[str, object]], list[dict[str, str]], pd.DataFrame]:
+    """Build one failure-condition table payload and keep a top slice for highlights."""
+    top = aggregate.sort_values(["failure_rate_pct", "n"], ascending=[ascending_failure, False]).copy()
+    top = top.head(12)
+    top["failure_rate_pct"] = top["failure_rate_pct"].round(2)
+    top["success_rate_pct"] = top["success_rate_pct"].round(2)
+    top["quality_score_pct"] = pd.to_numeric(top["quality_score_pct"], errors="coerce").round(2)
+
+    data = top.rename(columns={x_key: "x_condition", y_key: "y_condition"})[
+        ["x_condition", "y_condition", "failure_rate_pct", "success_rate_pct", "quality_score_pct", "n", "policy_count"]
+    ].to_dict("records")
+    return data, _failure_condition_table_columns(x_label, y_label), top
+
+
+def _build_failure_highlight_items(rows: pd.DataFrame, x_key: str, y_key: str) -> list[html.Li]:
+    """Build bullet items for top hardest/easiest failure conditions."""
+    items: list[html.Li] = []
+    for _, row in rows.head(3).iterrows():
+        items.append(
+            html.Li(
+                f"{row[y_key]} × {row[x_key]}: {row['failure_rate_pct']:.1f}% failure "
+                f"(n={int(row['n'])}, {int(row['policy_count'])} policies)"
+            )
+        )
+    return items
+
+
+def _build_failure_main_highlights(
+    detail_df: pd.DataFrame,
+    policy_order: list[str],
+    y_values: list[str],
+    x_values: list[str],
+    y_label: str,
+    x_label: str,
+    hardest_rows: pd.DataFrame,
+    easiest_rows: pd.DataFrame,
+    condition_order_mode: str,
+    x_key: str,
+    y_key: str,
+) -> html.Div:
+    """Build the summary/highlights panel shown above failure heatmaps."""
+    hardest_items = _build_failure_highlight_items(hardest_rows, x_key=x_key, y_key=y_key)
+    easiest_items = _build_failure_highlight_items(easiest_rows, x_key=x_key, y_key=y_key)
+    return html.Div(
+        [
+            html.Div(
+                f"Detailed rollout data loaded: {len(detail_df)} rows across {len(policy_order)} selected policies. "
+                f"Grid size detected: {len(y_values)} × {len(x_values)} ({y_label} × {x_label}).",
+                style={"fontWeight": "600"},
+            ),
+            html.Div("Hardest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
+            html.Ul(hardest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
+            html.Div("Easiest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
+            html.Ul(easiest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
+            html.Div(
+                (
+                    "Heatmap ordering: failure severity (highest to lowest)."
+                    if condition_order_mode == "failure"
+                    else "Heatmap ordering: original spreadsheet condition order."
+                ),
+                style={"fontSize": "12px", "color": "#666", "marginTop": "4px"},
+            ),
+        ]
+    )
+
+
 def _build_failure_policy_grid_figure(
     cell_df: pd.DataFrame,
     policy_names: list[str],
@@ -1296,13 +1708,6 @@ def _build_failure_aggregate_figure(
     if aggregate_df.empty:
         return _failure_empty_figure("No aggregate failure data available")
 
-    def _format_cell_label(value: float) -> str:
-        if metric_key in {"failure_rate_pct", "success_rate_pct", "quality_score_pct"}:
-            return f"{value:.1f}%"
-        if metric_key == "n":
-            return str(int(round(value)))
-        return f"{value:.2f}"
-
     z = (
         aggregate_df.pivot(index=y_key, columns=x_key, values=metric_key)
         .reindex(index=y_values, columns=x_values)
@@ -1335,16 +1740,7 @@ def _build_failure_aggregate_figure(
         ]
     )
 
-    if zmin is not None and math.isfinite(zmin):
-        zmin_eff = float(zmin)
-    else:
-        zmin_eff = float(np.nanmin(z)) if np.isfinite(np.nanmin(z)) else 0.0
-    if zmax is not None and math.isfinite(zmax):
-        zmax_eff = float(zmax)
-    else:
-        zmax_eff = float(np.nanmax(z)) if np.isfinite(np.nanmax(z)) else zmin_eff + 1.0
-    if zmax_eff <= zmin_eff:
-        zmax_eff = zmin_eff + 1.0
+    zmin_eff, zmax_eff = _resolve_failure_heatmap_bounds(z, zmin=zmin, zmax=zmax)
 
     annotations: list[dict[str, object]] = []
     for y_idx, y_value in enumerate(y_values):
@@ -1368,7 +1764,7 @@ def _build_failure_aggregate_figure(
                     "y": y_value,
                     "xref": "x",
                     "yref": "y",
-                    "text": _format_cell_label(numeric_value),
+                    "text": _format_failure_metric_cell_label(metric_key, numeric_value),
                     "showarrow": False,
                     "font": {"size": 11, "color": text_color},
                 }
@@ -1401,13 +1797,6 @@ def _build_failure_axis_aggregate_figure(
 ) -> go.Figure:
     if aggregate_df.empty or not axis_values:
         return _failure_empty_figure("No aggregate condition data available")
-
-    def _format_cell_label(value: float) -> str:
-        if metric_key in {"failure_rate_pct", "success_rate_pct", "quality_score_pct"}:
-            return f"{value:.1f}%"
-        if metric_key == "n":
-            return str(int(round(value)))
-        return f"{value:.2f}"
 
     z_row: list[float] = []
     n_row: list[float] = []
@@ -1449,18 +1838,7 @@ def _build_failure_axis_aggregate_figure(
         ]
     )
 
-    if zmin is not None and math.isfinite(zmin):
-        zmin_eff = float(zmin)
-    else:
-        finite_min = np.nanmin(z)
-        zmin_eff = float(finite_min) if np.isfinite(finite_min) else 0.0
-    if zmax is not None and math.isfinite(zmax):
-        zmax_eff = float(zmax)
-    else:
-        finite_max = np.nanmax(z)
-        zmax_eff = float(finite_max) if np.isfinite(finite_max) else zmin_eff + 1.0
-    if zmax_eff <= zmin_eff:
-        zmax_eff = zmin_eff + 1.0
+    zmin_eff, zmax_eff = _resolve_failure_heatmap_bounds(z, zmin=zmin, zmax=zmax)
 
     annotations: list[dict[str, object]] = []
     for x_idx, x_value in enumerate(axis_values):
@@ -1479,7 +1857,7 @@ def _build_failure_axis_aggregate_figure(
                 "y": row_label,
                 "xref": "x",
                 "yref": "y",
-                "text": _format_cell_label(numeric_value),
+                "text": _format_failure_metric_cell_label(metric_key, numeric_value),
                 "showarrow": False,
                 "font": {"size": 11, "color": text_color},
             }
@@ -1734,7 +2112,6 @@ app.layout = html.Div(
                                 html.Div(
                                     style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"},
                                     children=[
-                                        html.Button("Add Row", id="add-row-btn"),
                                         html.Button("Download CSV", id="download-btn"),
                                         dcc.Download(id="download-csv"),
                                     ],
@@ -1767,9 +2144,7 @@ app.layout = html.Div(
                                 {"name": "Quality Score [%] ↑", "id": "quality_score_pct"},
                                 {"name": "Success Rate [%] ↑", "id": "success_rate_pct"},
                                 {"name": "Drop in attempt [%] ↓", "id": "dropin_ratio_pct"},
-                                {"name": "policy_key", "id": "policy_key"},
                             ],
-                            hidden_columns=["policy_key"],
                             data=[],
                             page_size=15,
                             sort_action="native",
@@ -2316,6 +2691,7 @@ def sync_failure_policy_selectors(
     selected_testing_group: list[str] | str | None,
     current_active_group: list[str] | str | None,
 ):
+    """Keep failure-analysis selector widgets in sync with loaded rollout-detail data."""
     empty_result = ([], None, [], None, [], [], [], [], True, [])
     if not failure_store or not failure_store.get("records"):
         return empty_result
@@ -2338,28 +2714,15 @@ def sync_failure_policy_selectors(
             continue
         policy_meta_map[name] = entry
 
-    tag_order: list[str] = []
-    group_to_models: dict[str, list[str]] = {}
-    base_models: list[str] = []
-    base_seen: set[str] = set()
-
+    group_entries: list[tuple[str, list[str], bool]] = []
     for policy_name in policies:
         entry = policy_meta_map.get(policy_name, {})
         raw_tags = entry.get("testing_group_tags", [])
         tags = raw_tags if isinstance(raw_tags, list) else _split_testing_group_tags(raw_tags)
         row_is_base = bool(entry.get("is_base_group", False)) or any(_is_base_group_tag(tag) for tag in tags)
-        if row_is_base and policy_name not in base_seen:
-            base_models.append(policy_name)
-            base_seen.add(policy_name)
+        group_entries.append((policy_name, tags, row_is_base))
 
-        for tag in tags:
-            if _is_base_group_tag(tag):
-                continue
-            if tag not in group_to_models:
-                group_to_models[tag] = []
-                tag_order.append(tag)
-            if policy_name not in group_to_models[tag]:
-                group_to_models[tag].append(policy_name)
+    tag_order, group_to_models, base_models = _build_testing_group_index(group_entries)
 
     tag_options = [{"label": tag, "value": tag} for tag in tag_order]
     tag_set = set(tag_order)
@@ -2371,12 +2734,6 @@ def sync_failure_policy_selectors(
     active_groups = [group for group in _normalize_group_selection(current_active_group) if group in tag_set]
     current_checked = current_checked or []
 
-    def _groups_plus_base_selection(group_names: list[str]) -> list[str]:
-        selected = set(base_models)
-        for group_name in group_names:
-            selected.update(group_to_models.get(group_name, []))
-        return [model for model in policies if model in selected]
-
     if trigger == "failure-select-all-btn":
         checked = policies
         active_groups = []
@@ -2385,7 +2742,7 @@ def sync_failure_policy_selectors(
         active_groups = []
     elif trigger == "failure-apply-testing-group-btn":
         if selected_groups:
-            checked = _groups_plus_base_selection(selected_groups)
+            checked = _select_models_for_group_tags(selected_groups, base_models, group_to_models, policies)
             active_groups = selected_groups
         else:
             checked = [model for model in current_checked if model in policies]
@@ -2396,24 +2753,19 @@ def sync_failure_policy_selectors(
         checked = policies
         active_groups = []
     elif trigger == "failure-detail-store" and active_groups:
-        checked = _groups_plus_base_selection(active_groups)
+        checked = _select_models_for_group_tags(active_groups, base_models, group_to_models, policies)
     else:
         checked = [model for model in current_checked if model in policies]
         if not checked:
             checked = policies
 
-    dropdown_disabled = len(tag_options) == 0
-    if dropdown_disabled:
-        dropdown_value = []
-        active_groups = []
-    elif trigger == "failure-clear-testing-group-btn":
-        dropdown_value = []
-    elif selected_groups:
-        dropdown_value = selected_groups
-    elif active_groups:
-        dropdown_value = active_groups
-    else:
-        dropdown_value = []
+    dropdown_value, dropdown_disabled, active_groups = _resolve_group_dropdown_state(
+        trigger,
+        selected_groups,
+        active_groups,
+        tag_options,
+        clear_trigger_id="failure-clear-testing-group-btn",
+    )
 
     policy_pool = checked if checked else policies
     if current_policy_a in policy_pool:
@@ -2470,213 +2822,64 @@ def update_failure_views(
     selected_policy_a: str | None,
     selected_policy_b: str | None,
 ):
+    """Build aggregate and pairwise failure-analysis views from rollout-level detail rows."""
     empty_message = "Load or refresh a spreadsheet from A/B Testing page to see failure-analysis highlights."
-
-    def _empty_failure_result(message: str) -> tuple:
-        return (
-            _failure_empty_figure("Load spreadsheet data to render aggregate heatmap"),
-            _failure_empty_figure("Load spreadsheet data to render stack-condition aggregate heatmap"),
-            _failure_empty_figure("Load spreadsheet data to render robot-condition aggregate heatmap"),
-            _failure_empty_figure("Select two policies to compare aggregate condition heatmaps"),
-            _failure_empty_figure("Select two policies to compare stack-condition heatmaps"),
-            _failure_empty_figure("Select two policies to compare robot-condition heatmaps"),
-            [],
-            [],
-            [],
-            [],
-            message,
-        )
-
     if not failure_store or not failure_store.get("records"):
-        return _empty_failure_result(empty_message)
+        return _empty_failure_view_result(empty_message)
 
     detail_df = pd.DataFrame(failure_store.get("records") or [])
     if detail_df.empty:
-        return _empty_failure_result("No detail rollout rows available")
+        return _empty_failure_view_result("No detail rollout rows available")
 
     condition_columns = {
         str(entry.get("key", "")): str(entry.get("label", ""))
         for entry in (failure_store.get("condition_columns") or [])
         if str(entry.get("key", "")).strip()
     }
-    x_key = str(failure_store.get("default_x") or "")
-    y_key = str(failure_store.get("default_y") or "")
-    available_keys = [key for key in condition_columns if key in detail_df.columns]
-
-    if (not x_key or x_key not in detail_df.columns) and available_keys:
-        x_key = available_keys[0]
-    if (
-        (not y_key or y_key not in detail_df.columns or y_key == x_key)
-        and len(available_keys) > 1
-    ):
-        y_key = next((key for key in available_keys if key != x_key), "")
-
-    if not x_key or not y_key or x_key not in detail_df.columns or y_key not in detail_df.columns:
-        return _empty_failure_result("Condition axes are not available yet. Reload detail sheets and try again.")
+    x_key, y_key = _resolve_failure_axes(
+        detail_df,
+        condition_columns,
+        default_x=str(failure_store.get("default_x") or ""),
+        default_y=str(failure_store.get("default_y") or ""),
+    )
+    if x_key is None or y_key is None:
+        return _empty_failure_view_result("Condition axes are not available yet. Reload detail sheets and try again.")
 
     detail_df = detail_df.copy()
     detail_df["policy_name"] = detail_df["policy_name"].astype(str)
     detail_df["task_success"] = pd.to_numeric(detail_df["task_success"], errors="coerce")
     detail_df = detail_df[detail_df["task_success"].notna()].copy()
     if detail_df.empty:
-        return _empty_failure_result("No valid Task Success values detected in loaded detail sheets.")
+        return _empty_failure_view_result("No valid Task Success values detected in loaded detail sheets.")
 
     detail_df[x_key] = detail_df[x_key].fillna("NA").astype(str)
     detail_df[y_key] = detail_df[y_key].fillna("NA").astype(str)
     detail_df["quality_score_pct"] = pd.to_numeric(detail_df.get("quality_score_pct"), errors="coerce")
 
-    policy_order = list(dict.fromkeys(detail_df["policy_name"].tolist()))
-    if selected_failure_policies is None:
-        selected_policy_set = set(policy_order)
-    else:
-        normalized_selection = [str(name).strip() for name in (selected_failure_policies or []) if str(name).strip()]
-        if not normalized_selection:
-            return _empty_failure_result("No policies selected for failure aggregation.")
-        selected_policy_set = {name for name in normalized_selection if name in set(policy_order)}
-        if not selected_policy_set:
-            return _empty_failure_result("Selected failure policies have no rollout-detail rows.")
-
-    detail_df = detail_df[detail_df["policy_name"].isin(selected_policy_set)].copy()
-    if detail_df.empty:
-        return _empty_failure_result("No rollout-detail rows available for selected failure policies.")
-
-    policy_order = [name for name in policy_order if name in selected_policy_set]
-
-    grouped = (
-        detail_df.groupby(["policy_name", x_key, y_key], as_index=False)
-        .agg(
-            n=("task_success", "size"),
-            success_rate=("task_success", "mean"),
-            quality_score_pct=("quality_score_pct", "mean"),
-        )
+    detail_df, policy_order, selection_error = _filter_failure_policy_selection(
+        detail_df,
+        selected_failure_policies,
     )
-    grouped["failure_rate"] = 1.0 - grouped["success_rate"]
-    grouped["success_rate_pct"] = grouped["success_rate"] * 100.0
-    grouped["failure_rate_pct"] = grouped["failure_rate"] * 100.0
+    if selection_error is not None:
+        return _empty_failure_view_result(selection_error)
 
-    aggregate = (
-        detail_df.groupby([x_key, y_key], as_index=False)
-        .agg(
-            n=("task_success", "size"),
-            success_rate=("task_success", "mean"),
-            quality_score_pct=("quality_score_pct", "mean"),
-            policy_count=("policy_name", "nunique"),
-        )
+    grouped, aggregate, stack_aggregate, robot_aggregate = _aggregate_failure_frames(detail_df, x_key=x_key, y_key=y_key)
+
+    metric_key, metric_label, colorscale, zmin, zmax, metric_error = _resolve_failure_metric_settings(
+        metric_mode,
+        grouped,
     )
-    aggregate["failure_rate"] = 1.0 - aggregate["success_rate"]
-    aggregate["success_rate_pct"] = aggregate["success_rate"] * 100.0
-    aggregate["failure_rate_pct"] = aggregate["failure_rate"] * 100.0
+    if metric_error is not None:
+        return _empty_failure_view_result(metric_error)
 
-    stack_aggregate = (
-        detail_df.groupby([y_key], as_index=False)
-        .agg(
-            n=("task_success", "size"),
-            success_rate=("task_success", "mean"),
-            quality_score_pct=("quality_score_pct", "mean"),
-        )
+    condition_order_mode, x_values, y_values, stack_values, robot_values = _resolve_failure_condition_axis_values(
+        detail_df,
+        stack_aggregate,
+        robot_aggregate,
+        x_key=x_key,
+        y_key=y_key,
+        condition_order_mode=condition_order_mode,
     )
-    stack_aggregate["failure_rate"] = 1.0 - stack_aggregate["success_rate"]
-    stack_aggregate["success_rate_pct"] = stack_aggregate["success_rate"] * 100.0
-    stack_aggregate["failure_rate_pct"] = stack_aggregate["failure_rate"] * 100.0
-
-    robot_aggregate = (
-        detail_df.groupby([x_key], as_index=False)
-        .agg(
-            n=("task_success", "size"),
-            success_rate=("task_success", "mean"),
-            quality_score_pct=("quality_score_pct", "mean"),
-        )
-    )
-    robot_aggregate["failure_rate"] = 1.0 - robot_aggregate["success_rate"]
-    robot_aggregate["success_rate_pct"] = robot_aggregate["success_rate"] * 100.0
-    robot_aggregate["failure_rate_pct"] = robot_aggregate["failure_rate"] * 100.0
-
-    metric_mode = metric_mode or "failure_rate"
-    if metric_mode == "success_rate":
-        metric_key = "success_rate_pct"
-        metric_label = "Success rate (%)"
-        colorscale = "Greys"
-        zmin, zmax = 0.0, 100.0
-    elif metric_mode == "quality_score":
-        metric_key = "quality_score_pct"
-        metric_label = "Quality score mean (%)"
-        colorscale = "Greys"
-        finite_values = pd.to_numeric(grouped[metric_key], errors="coerce").dropna()
-        if finite_values.empty:
-            no_quality_msg = "Quality score column is missing in loaded detail sheets"
-            return _empty_failure_result(no_quality_msg)
-        zmin = max(0.0, float(math.floor(finite_values.min() / 5.0) * 5.0))
-        zmax = min(100.0, float(math.ceil(finite_values.max() / 5.0) * 5.0))
-        if zmax <= zmin:
-            zmax = zmin + 1.0
-    elif metric_mode == "sample_count":
-        metric_key = "n"
-        metric_label = "Sample count (n)"
-        colorscale = "Greys"
-        zmin = 0.0
-        zmax = float(max(1.0, grouped[metric_key].max()))
-    else:
-        metric_key = "failure_rate_pct"
-        metric_label = "Failure rate (%)"
-        colorscale = "Greys"
-        zmin, zmax = 0.0, 100.0
-
-    condition_order_mode = condition_order_mode or "original"
-    if condition_order_mode == "failure":
-        x_ranked = (
-            detail_df.groupby([x_key], as_index=False)
-            .agg(success_rate=("task_success", "mean"))
-        )
-        x_ranked[x_key] = x_ranked[x_key].astype(str)
-        x_ranked["failure_rate_pct"] = (1.0 - pd.to_numeric(x_ranked["success_rate"], errors="coerce")) * 100.0
-        x_ranked["condition_sort_key"] = x_ranked[x_key].map(_condition_sort_key)
-        x_ranked = x_ranked.sort_values(
-            ["failure_rate_pct", "condition_sort_key"],
-            ascending=[False, True],
-            kind="stable",
-        )
-        x_values = x_ranked[x_key].drop_duplicates().tolist()
-
-        y_ranked = (
-            detail_df.groupby([y_key], as_index=False)
-            .agg(success_rate=("task_success", "mean"))
-        )
-        y_ranked[y_key] = y_ranked[y_key].astype(str)
-        y_ranked["failure_rate_pct"] = (1.0 - pd.to_numeric(y_ranked["success_rate"], errors="coerce")) * 100.0
-        y_ranked["condition_sort_key"] = y_ranked[y_key].map(_condition_sort_key)
-        y_ranked = y_ranked.sort_values(
-            ["failure_rate_pct", "condition_sort_key"],
-            ascending=[False, True],
-            kind="stable",
-        )
-        y_values = y_ranked[y_key].drop_duplicates().tolist()
-
-        stack_ranked = stack_aggregate.copy()
-        stack_ranked[y_key] = stack_ranked[y_key].astype(str)
-        stack_ranked["failure_rate_pct"] = pd.to_numeric(stack_ranked["failure_rate_pct"], errors="coerce")
-        stack_ranked["condition_sort_key"] = stack_ranked[y_key].map(_condition_sort_key)
-        stack_ranked = stack_ranked.sort_values(
-            ["failure_rate_pct", "condition_sort_key"],
-            ascending=[False, True],
-            kind="stable",
-        )
-        stack_values = stack_ranked[y_key].drop_duplicates().tolist()
-
-        robot_ranked = robot_aggregate.copy()
-        robot_ranked[x_key] = robot_ranked[x_key].astype(str)
-        robot_ranked["failure_rate_pct"] = pd.to_numeric(robot_ranked["failure_rate_pct"], errors="coerce")
-        robot_ranked["condition_sort_key"] = robot_ranked[x_key].map(_condition_sort_key)
-        robot_ranked = robot_ranked.sort_values(
-            ["failure_rate_pct", "condition_sort_key"],
-            ascending=[False, True],
-            kind="stable",
-        )
-        robot_values = robot_ranked[x_key].drop_duplicates().tolist()
-    else:
-        x_values = detail_df[x_key].astype(str).drop_duplicates().tolist()
-        y_values = detail_df[y_key].astype(str).drop_duplicates().tolist()
-        stack_values = y_values.copy()
-        robot_values = x_values.copy()
 
     aggregate_fig = _build_failure_aggregate_figure(
         aggregate,
@@ -2721,14 +2924,7 @@ def update_failure_views(
         title=f"Aggregated by {x_label} ({metric_label})",
     )
 
-    selected_pair: list[str] = []
-    for candidate in [selected_policy_a, selected_policy_b]:
-        text = str(candidate).strip() if candidate is not None else ""
-        if text and text in policy_order and text not in selected_pair:
-            selected_pair.append(text)
-    if len(selected_pair) < 2:
-        selected_pair = policy_order[:2]
-    selected_pair = selected_pair[:2]
+    selected_pair = _select_failure_policy_pair(policy_order, selected_policy_a, selected_policy_b)
 
     policy_display_map, _policy_prefix = _make_display_names(policy_order)
 
@@ -2752,7 +2948,7 @@ def update_failure_views(
             share_yaxes=True,
         )
 
-        policy_stack_aggregate = (
+        policy_stack_aggregate = _with_failure_rate_columns(
             grouped.groupby(["policy_name", y_key], as_index=False)
             .agg(
                 n=("n", "sum"),
@@ -2760,11 +2956,8 @@ def update_failure_views(
                 quality_score_pct=("quality_score_pct", "mean"),
             )
         )
-        policy_stack_aggregate["failure_rate"] = 1.0 - policy_stack_aggregate["success_rate"]
-        policy_stack_aggregate["success_rate_pct"] = policy_stack_aggregate["success_rate"] * 100.0
-        policy_stack_aggregate["failure_rate_pct"] = policy_stack_aggregate["failure_rate"] * 100.0
 
-        policy_robot_aggregate = (
+        policy_robot_aggregate = _with_failure_rate_columns(
             grouped.groupby(["policy_name", x_key], as_index=False)
             .agg(
                 n=("n", "sum"),
@@ -2772,9 +2965,6 @@ def update_failure_views(
                 quality_score_pct=("quality_score_pct", "mean"),
             )
         )
-        policy_robot_aggregate["failure_rate"] = 1.0 - policy_robot_aggregate["success_rate"]
-        policy_robot_aggregate["success_rate_pct"] = policy_robot_aggregate["success_rate"] * 100.0
-        policy_robot_aggregate["failure_rate_pct"] = policy_robot_aggregate["failure_rate"] * 100.0
 
         policy_stack_fig = _build_failure_policy_axis_pair_figure(
             policy_stack_aggregate,
@@ -2814,72 +3004,35 @@ def update_failure_views(
         policy_stack_fig = _failure_empty_figure("Select two policies to compare stack-condition heatmaps")
         policy_robot_fig = _failure_empty_figure("Select two policies to compare robot-condition heatmaps")
 
-    hardest = aggregate.sort_values(["failure_rate_pct", "n"], ascending=[False, False]).copy()
-    hardest = hardest.head(12)
-    hardest["failure_rate_pct"] = hardest["failure_rate_pct"].round(2)
-    hardest["success_rate_pct"] = hardest["success_rate_pct"].round(2)
-    hardest["quality_score_pct"] = pd.to_numeric(hardest["quality_score_pct"], errors="coerce").round(2)
-    hardest_data = hardest.rename(columns={x_key: "x_condition", y_key: "y_condition"})[
-        ["x_condition", "y_condition", "failure_rate_pct", "success_rate_pct", "quality_score_pct", "n", "policy_count"]
-    ].to_dict("records")
-    hardest_columns = [
-        {"name": x_label, "id": "x_condition"},
-        {"name": y_label, "id": "y_condition"},
-        {"name": "Failure (%)", "id": "failure_rate_pct"},
-        {"name": "Success (%)", "id": "success_rate_pct"},
-        {"name": "Quality (%)", "id": "quality_score_pct"},
-        {"name": "n", "id": "n"},
-        {"name": "Policies", "id": "policy_count"},
-    ]
+    hardest_data, hardest_columns, hardest_rows = _build_failure_condition_table(
+        aggregate,
+        x_key=x_key,
+        y_key=y_key,
+        x_label=x_label,
+        y_label=y_label,
+        ascending_failure=False,
+    )
+    easiest_data, easiest_columns, easiest_rows = _build_failure_condition_table(
+        aggregate,
+        x_key=x_key,
+        y_key=y_key,
+        x_label=x_label,
+        y_label=y_label,
+        ascending_failure=True,
+    )
 
-    easiest = aggregate.sort_values(["failure_rate_pct", "n"], ascending=[True, False]).copy()
-    easiest = easiest.head(12)
-    easiest["failure_rate_pct"] = easiest["failure_rate_pct"].round(2)
-    easiest["success_rate_pct"] = easiest["success_rate_pct"].round(2)
-    easiest["quality_score_pct"] = pd.to_numeric(easiest["quality_score_pct"], errors="coerce").round(2)
-    easiest_data = easiest.rename(columns={x_key: "x_condition", y_key: "y_condition"})[
-        ["x_condition", "y_condition", "failure_rate_pct", "success_rate_pct", "quality_score_pct", "n", "policy_count"]
-    ].to_dict("records")
-    easiest_columns = hardest_columns
-
-    hardest_items: list[html.Li] = []
-    for _, row in hardest.head(3).iterrows():
-        hardest_items.append(
-            html.Li(
-                f"{row[y_key]} × {row[x_key]}: {row['failure_rate_pct']:.1f}% failure "
-                f"(n={int(row['n'])}, {int(row['policy_count'])} policies)"
-            )
-        )
-
-    easiest_items: list[html.Li] = []
-    for _, row in easiest.head(3).iterrows():
-        easiest_items.append(
-            html.Li(
-                f"{row[y_key]} × {row[x_key]}: {row['failure_rate_pct']:.1f}% failure "
-                f"(n={int(row['n'])}, {int(row['policy_count'])} policies)"
-            )
-        )
-
-    main_highlights = html.Div(
-        [
-            html.Div(
-                f"Detailed rollout data loaded: {len(detail_df)} rows across {len(policy_order)} selected policies. "
-                f"Grid size detected: {len(y_values)} × {len(x_values)} ({y_label} × {x_label}).",
-                style={"fontWeight": "600"},
-            ),
-            html.Div("Hardest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
-            html.Ul(hardest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
-            html.Div("Easiest conditions:", style={"fontWeight": "600", "marginTop": "6px"}),
-            html.Ul(easiest_items, style={"marginTop": "4px", "marginBottom": "6px"}),
-            html.Div(
-                (
-                    "Heatmap ordering: failure severity (highest to lowest)."
-                    if condition_order_mode == "failure"
-                    else "Heatmap ordering: original spreadsheet condition order."
-                ),
-                style={"fontSize": "12px", "color": "#666", "marginTop": "4px"},
-            ),
-        ]
+    main_highlights = _build_failure_main_highlights(
+        detail_df,
+        policy_order,
+        y_values,
+        x_values,
+        y_label,
+        x_label,
+        hardest_rows,
+        easiest_rows,
+        condition_order_mode,
+        x_key=x_key,
+        y_key=y_key,
     )
 
     return (
@@ -3100,31 +3253,6 @@ def load_file_to_table(
 
 
 @app.callback(
-    Output("raw-table", "data", allow_duplicate=True),
-    Input("add-row-btn", "n_clicks"),
-    State("raw-table", "data"),
-    State("raw-table", "columns"),
-    prevent_initial_call=True,
-)
-def add_table_row(_: int, rows: list[dict] | None, columns: list[dict] | None):
-    if columns is None:
-        columns = _default_columns()
-    rows = rows or []
-
-    new_row = {}
-    for col in columns:
-        col_id = col.get("id")
-        if col_id == "trials":
-            new_row[col_id] = DEFAULT_TRIALS
-        elif col_id == "successes":
-            new_row[col_id] = 0
-        else:
-            new_row[col_id] = ""
-    rows.append(new_row)
-    return rows
-
-
-@app.callback(
     Output("download-csv", "data"),
     Input("download-btn", "n_clicks"),
     State("raw-table", "data"),
@@ -3171,6 +3299,7 @@ def sync_policy_selectors(
     selected_testing_group: list[str] | str | None,
     current_active_group: list[str] | str | None,
 ):
+    """Synchronize A/B and multi-policy selectors after table edits or group actions."""
     clean_df = _raw_to_clean_df(rows)
     if "has_success_rate_input" in clean_df.columns and not clean_df.empty:
         eligible_models = clean_df.loc[clean_df["has_success_rate_input"].fillna(True), "model_name"].astype(str).tolist()
@@ -3194,11 +3323,7 @@ def sync_policy_selectors(
         tag_df["is_base_group"] = False
     tag_df["is_base_group"] = tag_df["is_base_group"].fillna(False).astype(bool)
 
-    tag_order: list[str] = []
-    group_to_models: dict[str, list[str]] = {}
-    base_models: list[str] = []
-    base_seen: set[str] = set()
-
+    group_entries: list[tuple[str, list[str], bool]] = []
     for _, row in tag_df.iterrows():
         model_name = str(row.get("model_name", "")).strip()
         if not model_name:
@@ -3209,18 +3334,9 @@ def sync_policy_selectors(
             tags = _split_testing_group_tags(tags)
 
         row_is_base = bool(row.get("is_base_group", False)) or any(_is_base_group_tag(tag) for tag in tags)
-        if row_is_base and model_name not in base_seen:
-            base_models.append(model_name)
-            base_seen.add(model_name)
+        group_entries.append((model_name, tags, row_is_base))
 
-        for tag in tags:
-            if _is_base_group_tag(tag):
-                continue
-            if tag not in group_to_models:
-                group_to_models[tag] = []
-                tag_order.append(tag)
-            if model_name not in group_to_models[tag]:
-                group_to_models[tag].append(model_name)
+    tag_order, group_to_models, base_models = _build_testing_group_index(group_entries)
 
     tag_options = [{"label": tag, "value": tag} for tag in tag_order]
     tag_set = set(tag_order)
@@ -3246,12 +3362,6 @@ def sync_policy_selectors(
     current_checked = current_checked or []
     active_groups = [group for group in _normalize_group_selection(current_active_group) if group in tag_set]
 
-    def _groups_plus_base_selection(group_names: list[str]) -> list[str]:
-        selected = set(base_models)
-        for group_name in group_names:
-            selected.update(group_to_models.get(group_name, []))
-        return [model for model in models if model in selected]
-
     selected_groups = [group for group in _normalize_group_selection(selected_testing_group) if group in tag_set]
 
     if trigger == "select-all-btn":
@@ -3262,7 +3372,7 @@ def sync_policy_selectors(
         active_groups = []
     elif trigger == "apply-testing-group-btn":
         if selected_groups:
-            checked = _groups_plus_base_selection(selected_groups)
+            checked = _select_models_for_group_tags(selected_groups, base_models, group_to_models, models)
             active_groups = selected_groups
         else:
             checked = [m for m in current_checked if m in models]
@@ -3273,24 +3383,19 @@ def sync_policy_selectors(
         checked = eligible_models
         active_groups = []
     elif trigger == "raw-table" and active_groups:
-        checked = _groups_plus_base_selection(active_groups)
+        checked = _select_models_for_group_tags(active_groups, base_models, group_to_models, models)
     else:
         checked = [m for m in current_checked if m in models]
         if not checked:
             checked = eligible_models
 
-    dropdown_disabled = len(tag_options) == 0
-    if dropdown_disabled:
-        dropdown_value = []
-        active_groups = []
-    elif trigger == "clear-testing-group-btn":
-        dropdown_value = []
-    elif selected_groups:
-        dropdown_value = selected_groups
-    elif active_groups:
-        dropdown_value = active_groups
-    else:
-        dropdown_value = []
+    dropdown_value, dropdown_disabled, active_groups = _resolve_group_dropdown_state(
+        trigger,
+        selected_groups,
+        active_groups,
+        tag_options,
+        clear_trigger_id="clear-testing-group-btn",
+    )
 
     return (
         options,
@@ -3403,16 +3508,16 @@ def update_leaderboard_content(
                 "dropin_ratio_pct": round(float(row["dropin_ratio_pct"]), 2)
                 if pd.notna(row.get("dropin_ratio_pct"))
                 else None,
-                "policy_key": policy_name,
             }
         )
 
     leaderboard_styles: list[dict[str, object]] = []
     if base_policy_selected and base_policy_selected in set(metrics["model_name"].astype(str)):
-        safe_base = str(base_policy_selected).replace('"', '\\"')
+        base_policy_display = display_map.get(str(base_policy_selected), str(base_policy_selected))
+        safe_base = str(base_policy_display).replace('"', '\\"')
         leaderboard_styles.append(
             {
-                "if": {"filter_query": f'{{policy_key}} = "{safe_base}"'},
+                "if": {"filter_query": f'{{policy}} = "{safe_base}"'},
                 "fontWeight": "700",
                 "backgroundColor": "#f5f5f5",
             }

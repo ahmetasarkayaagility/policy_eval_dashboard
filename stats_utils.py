@@ -30,6 +30,11 @@ def _empty_base_vs_policy_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=BASE_VS_POLICY_COLUMNS)
 
 
+def _empty_float_series(index: pd.Index) -> pd.Series:
+    """Return an empty float-typed series aligned to *index*."""
+    return pd.Series(index=index, dtype=float)
+
+
 def z_value(confidence_level: float) -> float:
     """Return the two-sided normal critical value for a confidence level."""
     alpha = 1.0 - confidence_level
@@ -124,8 +129,8 @@ def prepare_policy_metrics(df: pd.DataFrame, confidence_level: float) -> pd.Data
         out["wilson_low"] = lows
         out["wilson_high"] = highs
     else:
-        out["wilson_low"] = []
-        out["wilson_high"] = []
+        out["wilson_low"] = _empty_float_series(out.index)
+        out["wilson_high"] = _empty_float_series(out.index)
     return out.reset_index(drop=True)
 
 
