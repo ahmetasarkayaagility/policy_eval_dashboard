@@ -1726,6 +1726,7 @@ app.layout = html.Div(
                             ],
                         ),
                         html.Div(id="ab-output", style={"marginTop": "10px"}),
+                        html.Div(id="ab-common-legend", style={"marginTop": "8px"}),
                         html.Div(
                             style={
                                 "display": "grid",
@@ -1741,16 +1742,6 @@ app.layout = html.Div(
                             ],
                         ),
                         dcc.Graph(id="ab-failure-heatmap-graph"),
-                        html.H4("Failure mode highlights (quick sneak peek)"),
-                        html.Div(
-                            id="failure-main-highlights",
-                            style={
-                                "background": "#fafafa",
-                                "border": "1px solid #e0e0e0",
-                                "borderRadius": "6px",
-                                "padding": "10px 12px",
-                            },
-                        ),
                     ],
                 ),
                 html.Div(
@@ -1924,6 +1915,16 @@ app.layout = html.Div(
                 html.P(
                     "Dedicated page for detailed rollout-level diagnostics. "
                     "Load per-policy detail links, then inspect the aggregate condition grid across selected completed policies."
+                ),
+                html.H4("Failure mode highlights"),
+                html.Div(
+                    id="failure-main-highlights",
+                    style={
+                        "background": "#fafafa",
+                        "border": "1px solid #e0e0e0",
+                        "borderRadius": "6px",
+                        "padding": "10px 12px",
+                    },
                 ),
                 html.Div(
                     style={"display": "grid", "gap": "8px"},
@@ -2417,7 +2418,7 @@ def update_failure_views(
     selected_policy_a: str | None,
     selected_policy_b: str | None,
 ):
-    empty_message = "Load or refresh a spreadsheet from Main Dashboard to see failure-analysis highlights."
+    empty_message = "Load or refresh a spreadsheet from A/B Testing page to see failure-analysis highlights."
 
     def _empty_failure_result(message: str) -> tuple:
         return (
@@ -3606,6 +3607,7 @@ def update_leaderboard_content(
     Output("summary-table", "data"),
     Output("summary-table", "columns"),
     Output("ab-output", "children"),
+    Output("ab-common-legend", "children"),
     Output("ab-comparison-graph", "figure"),
     Output("ab-quality-graph", "figure"),
     Output("ab-dropin-graph", "figure"),
@@ -3656,15 +3658,20 @@ def update_analysis(
     active_group_label = ", ".join(active_group_values) if active_group_values else None
     final_violin_style = {"display": "block"} if show_final_violin else {"display": "none"}
     allvsall_violin_style = {"display": "block"} if show_allvsall_violin else {"display": "none"}
+    ab_common_legend_default = html.Div(
+        "Select Policy A and Policy B to show shared color legend.",
+        style={"fontSize": "12px", "color": "#666"},
+    )
 
     if clean_df.empty:
         return (
             [],
             [],
             "Add policy rows to start analysis.",
+            ab_common_legend_default,
             _empty_figure("Pick two policies for A/B plot"),
             _empty_figure("No quality score data for selected A/B policies"),
-            _empty_figure("No drop-in ratio data for selected A/B policies (lower is better)"),
+            _empty_figure("No drop-in attempt data for selected A/B policies"),
             _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps"),
             _empty_figure("Pick two policies for posterior uncertainty view"),
             _empty_figure("No policy data"),
@@ -3693,9 +3700,10 @@ def update_analysis(
             [],
             [],
             "No concluded policies available: success rate is empty for all rows.",
+            ab_common_legend_default,
             _empty_figure("Pick two concluded policies for A/B plot"),
             _empty_figure("No quality score data for selected A/B policies"),
-            _empty_figure("No drop-in ratio data for selected A/B policies (lower is better)"),
+            _empty_figure("No drop-in attempt data for selected A/B policies"),
             _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps"),
             _empty_figure("Pick two concluded policies for posterior uncertainty view"),
             _empty_figure("No concluded policies selected"),
@@ -3719,7 +3727,6 @@ def update_analysis(
     metrics = _apply_sort_mode(metrics, sort_mode, pin_first=policy_a)
     all_names = metrics["model_name"].astype(str).tolist()
     display_map, prefix = _make_display_names(all_names)
-    _prefix_sub = f"<br><sup>common prefix: {prefix}</sup>" if prefix else ""
     _multi_sub_parts: list[str] = []
     if active_group_label:
         if len(active_group_values) > 1:
@@ -3789,9 +3796,10 @@ def update_analysis(
         summary_columns.append({"name": "dropin_ci_high_%_lower_better", "id": "dropin_wilson_high"})
 
     ab_output = "Pick two policies to compare."
+    ab_common_legend = ab_common_legend_default
     ab_fig = _empty_figure("Pick two policies for A/B plot")
     ab_quality_fig = _empty_figure("No quality score data for selected A/B policies")
-    ab_dropin_fig = _empty_figure("No drop-in ratio data for selected A/B policies (lower is better)")
+    ab_dropin_fig = _empty_figure("No drop-in attempt data for selected A/B policies")
     ab_failure_heatmap_fig = _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps")
     ab_violin_fig = _empty_figure("Pick two policies for A/B posterior view")
 
@@ -3854,6 +3862,45 @@ def update_analysis(
 
         ab_policies = [policy_a, policy_b]
         ab_df = metrics.set_index("model_name").loc[ab_policies].reset_index()
+        _legend_entries = []
+        for label, policy_name, role in [
+            ("Policy A", policy_a, "base"),
+            ("Policy B", policy_b, "experimental"),
+        ]:
+            _legend_entries.append(
+                html.Div(
+                    [
+                        html.Span("●", style={"color": policy_colors.get(policy_name, "#1f77b4"), "fontSize": "16px"}),
+                        html.Span(
+                            f" {label}: {display_map.get(policy_name, policy_name)} ({role})",
+                            style={"fontSize": "13px"},
+                        ),
+                    ],
+                    style={"display": "flex", "alignItems": "center", "gap": "4px"},
+                )
+            )
+
+        _legend_notes = [
+            html.Span("Success/Quality ↑ | Drop-in ↓", style={"fontSize": "12px", "color": "#666"})
+        ]
+        if prefix:
+            _legend_notes.append(
+                html.Span(f"Common prefix stripped: {prefix}", style={"fontSize": "12px", "color": "#666"})
+            )
+
+        ab_common_legend = html.Div(
+            [
+                html.Div(
+                    _legend_entries,
+                    style={"display": "flex", "flexWrap": "wrap", "gap": "14px", "alignItems": "center"},
+                ),
+                html.Div(
+                    _legend_notes,
+                    style={"display": "flex", "flexWrap": "wrap", "gap": "12px", "marginTop": "4px"},
+                ),
+            ]
+        )
+
         ab_df["success_rate"] = ab_df["successes"] / ab_df["trials"]
         ab_ci = ab_df.apply(
             lambda row: wilson_interval(int(row["successes"]), int(row["trials"]), confidence_level),
@@ -3878,14 +3925,16 @@ def update_analysis(
         )
         ab_fig.update_layout(
             template="plotly_white",
-            yaxis_title="Success Rate (%)",
-            xaxis_title="Policy",
-            title=f"A/B policy comparison with {int(confidence_level * 100)}% Wilson CIs{_prefix_sub}",
+            yaxis_title="Success Rate [%] ↑",
+            xaxis_title="",
+            title=None,
             yaxis_range=[0, min(105, max(5, math.ceil((ab_df["wilson_high"].max() * 100) / 5) * 5 + 5))],
             bargap=0.0,
             bargroupgap=0.0,
             height=320,
+            margin={"l": 45, "r": 20, "t": 20, "b": 30},
         )
+        ab_fig.update_xaxes(showticklabels=False)
 
         q_better = q_worse = False
         di_better = di_worse = False
@@ -3932,14 +3981,16 @@ def update_analysis(
             ab_quality_fig.add_bar(**_qbar_kw)
             ab_quality_fig.update_layout(
                 template="plotly_white",
-                yaxis_title="Quality Score (%)",
-                xaxis_title="Policy",
-                title="A/B quality score comparison" + (f" with {int(confidence_level * 100)}% CIs" if ab_has_qstd else "") + _prefix_sub,
+                yaxis_title="Quality Score [%] ↑",
+                xaxis_title="",
+                title=None,
                 yaxis_range=[0, min(105, max(5, math.ceil(q_max_y / 5) * 5 + 5))],
                 bargap=0.0,
                 bargroupgap=0.0,
                 height=320,
+                margin={"l": 45, "r": 20, "t": 20, "b": 30},
             )
+            ab_quality_fig.update_xaxes(showticklabels=False)
 
             # Welch t-test for quality scores
             if ab_has_qstd:
@@ -4026,14 +4077,16 @@ def update_analysis(
             )
             ab_dropin_fig.update_layout(
                 template="plotly_white",
-                yaxis_title="Attempt Drop-in Ratio (%) (lower is better)",
-                xaxis_title="Policy",
-                title=f"A/B attempt drop-in comparison (lower is better) with {int(confidence_level * 100)}% Wilson CIs{_prefix_sub}",
+                yaxis_title="Drop-in Attempt [%] ↓",
+                xaxis_title="",
+                title=None,
                 yaxis_range=[0, min(105, max(5, math.ceil(_di_max_y_ab / 5) * 5 + 5))],
                 bargap=0.0,
                 bargroupgap=0.0,
                 height=320,
+                margin={"l": 45, "r": 20, "t": 20, "b": 30},
             )
+            ab_dropin_fig.update_xaxes(showticklabels=False)
 
             # Newcombe-Wilson CI for drop-in difference (lower is better)
             _di_a = ab_df.loc[ab_df["model_name"] == policy_a].iloc[0]
@@ -4065,7 +4118,7 @@ def update_analysis(
 
             dropin_card = html.Div(
                 [
-                    html.Div("Attempt Drop-in Ratio (lower is better)", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                    html.Div("Drop-in Attempt [%] ↓", style={"fontWeight": "bold", "marginBottom": "4px"}),
                     html.Div(
                         f"\u0394 (B \u2212 A): {_di_delta * 100:.2f} pp, "
                         f"{confidence_level * 100:.0f}% CI: [{_di_dlow * 100:.2f}, {_di_dhigh * 100:.2f}] pp"
@@ -4148,18 +4201,21 @@ def update_analysis(
             ab_df,
             ab_letters,
             policy_colors,
-            f"A/B posterior uncertainty (Bayesian){_prefix_sub}",
+            "",
             display_names=display_map,
         )
         _ab_short_names = [display_map.get(policy_a, policy_a), display_map.get(policy_b, policy_b)]
         ab_violin_fig.update_layout(
             height=320,
-            margin={"l": 45, "r": 20, "t": 70, "b": 45},
+            margin={"l": 45, "r": 20, "t": 20, "b": 30},
+            title=None,
             violingap=0.0,
             violingroupgap=0.0,
         )
         ab_violin_fig.update_traces(width=0.9, selector={"type": "violin"})
         ab_violin_fig.update_xaxes(categoryorder="array", categoryarray=_ab_short_names)
+        ab_violin_fig.update_xaxes(showticklabels=False, title_text="")
+        ab_violin_fig.update_yaxes(title_text="Success Rate [%] ↑")
 
     if policy_a and policy_b and failure_store and failure_store.get("records"):
         ab_failure_df = pd.DataFrame(failure_store.get("records") or [])
@@ -4221,7 +4277,7 @@ def update_analysis(
                             zmax=100.0,
                             display_names=display_map,
                             n_cols=2,
-                            title=f"A/B condition heatmap comparison (Success rate %){_prefix_sub}",
+                            title="A/B condition heatmap comparison (Success rate %)",
                             height=340,
                             share_yaxes=True,
                         )
@@ -4610,6 +4666,7 @@ def update_analysis(
         summary_table_data,
         summary_columns,
         ab_output,
+        ab_common_legend,
         ab_fig,
         ab_quality_fig,
         ab_dropin_fig,
