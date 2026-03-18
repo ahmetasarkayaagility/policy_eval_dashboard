@@ -602,6 +602,172 @@ def _build_posterior_violin(
     return fig
 
 
+def _build_quality_posterior_violin(
+    plot_df: pd.DataFrame,
+    letters: dict[str, str] | None,
+    policy_colors: dict[str, str],
+    title: str,
+    display_names: dict[str, str] | None = None,
+) -> go.Figure:
+    if plot_df.empty:
+        return _empty_figure("No selected policies for quality uncertainty view")
+    if "quality_score_pct" not in plot_df.columns or "quality_score_std_pct" not in plot_df.columns:
+        return _empty_figure("No quality-score uncertainty data for selected policies")
+
+    _dn = display_names or {}
+    rng = np.random.default_rng(20260313)
+    n_samples = 1200
+
+    fig = go.Figure()
+    for _, row in plot_df.reset_index(drop=True).iterrows():
+        model_name = str(row["model_name"])
+        short = _dn.get(model_name, model_name)
+        color = policy_colors.get(model_name, "#1f77b4")
+
+        mean_pct = _coerce_scalar_float(row.get("quality_score_pct"))
+        std_pct = _coerce_scalar_float(row.get("quality_score_std_pct"))
+        trials = int(row.get("trials", 0)) if pd.notna(row.get("trials")) else 0
+        if mean_pct is None or std_pct is None or std_pct < 0 or trials <= 1:
+            continue
+
+        mean_pct = max(0.0, min(100.0, mean_pct))
+        standard_error = max(1e-6, std_pct / math.sqrt(trials))
+        posterior_samples = rng.normal(loc=mean_pct, scale=standard_error, size=n_samples)
+        posterior_samples = np.clip(posterior_samples, 0.0, 100.0)
+
+        fig.add_trace(
+            go.Violin(
+                x=[short] * n_samples,
+                y=posterior_samples,
+                legendgroup=model_name,
+                scalegroup=model_name,
+                name=short,
+                showlegend=False,
+                points=False,
+                meanline_visible=True,
+                line_color=_hex_to_rgba(color, 0.95),
+                fillcolor=_hex_to_rgba(color, 0.42),
+            )
+        )
+
+    if not fig.data:
+        return _empty_figure("No quality-score uncertainty data for selected policies")
+
+    letter_map = letters or {}
+    annotations = []
+    for model_name in plot_df["model_name"].astype(str).tolist():
+        short = _dn.get(model_name, model_name)
+        group_letters = letter_map.get(model_name, "")
+        if not group_letters:
+            continue
+        annotations.append(
+            {
+                "x": short,
+                "y": 103,
+                "text": f"<b>{group_letters}</b>",
+                "showarrow": False,
+                "font": {"size": 16},
+            }
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        violinmode="group",
+        violingap=0.0,
+        violingroupgap=0.0,
+        yaxis_title="Quality Score (%)",
+        xaxis_title="Policy",
+        title=title,
+        yaxis_range=[0, 105],
+        annotations=annotations,
+    )
+    fig.update_traces(width=0.95, selector={"type": "violin"})
+    return fig
+
+
+def _build_dropin_posterior_violin(
+    plot_df: pd.DataFrame,
+    letters: dict[str, str] | None,
+    policy_colors: dict[str, str],
+    title: str,
+    display_names: dict[str, str] | None = None,
+) -> go.Figure:
+    if plot_df.empty:
+        return _empty_figure("No selected policies for drop-in uncertainty view")
+    if "dropin_count" not in plot_df.columns:
+        return _empty_figure("No drop-in uncertainty data for selected policies")
+
+    _dn = display_names or {}
+    rng = np.random.default_rng(20260314)
+    n_samples = 1200
+    prior_alpha = 1.0
+    prior_beta = 1.0
+
+    fig = go.Figure()
+    for _, row in plot_df.reset_index(drop=True).iterrows():
+        model_name = str(row["model_name"])
+        short = _dn.get(model_name, model_name)
+        color = policy_colors.get(model_name, "#1f77b4")
+
+        trials = int(row.get("trials", 0)) if pd.notna(row.get("trials")) else 0
+        dropin_count = int(row.get("dropin_count", 0)) if pd.notna(row.get("dropin_count")) else 0
+        if trials <= 0:
+            continue
+
+        dropin_count = max(0, min(dropin_count, trials))
+        non_dropin_count = max(0, trials - dropin_count)
+        posterior_samples = rng.beta(prior_alpha + dropin_count, prior_beta + non_dropin_count, size=n_samples) * 100.0
+
+        fig.add_trace(
+            go.Violin(
+                x=[short] * n_samples,
+                y=posterior_samples,
+                legendgroup=model_name,
+                scalegroup=model_name,
+                name=short,
+                showlegend=False,
+                points=False,
+                meanline_visible=True,
+                line_color=_hex_to_rgba(color, 0.95),
+                fillcolor=_hex_to_rgba(color, 0.42),
+            )
+        )
+
+    if not fig.data:
+        return _empty_figure("No drop-in uncertainty data for selected policies")
+
+    letter_map = letters or {}
+    annotations = []
+    for model_name in plot_df["model_name"].astype(str).tolist():
+        short = _dn.get(model_name, model_name)
+        group_letters = letter_map.get(model_name, "")
+        if not group_letters:
+            continue
+        annotations.append(
+            {
+                "x": short,
+                "y": 103,
+                "text": f"<b>{group_letters}</b>",
+                "showarrow": False,
+                "font": {"size": 16},
+            }
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        violinmode="group",
+        violingap=0.0,
+        violingroupgap=0.0,
+        yaxis_title="Attempt Drop-in Ratio (%) (lower is better)",
+        xaxis_title="Policy",
+        title=title,
+        yaxis_range=[0, 105],
+        annotations=annotations,
+    )
+    fig.update_traces(width=0.95, selector={"type": "violin"})
+    return fig
+
+
 def _build_base_vs_pairs_violin(
     plot_df: pd.DataFrame,
     base_policy: str,
@@ -2085,7 +2251,7 @@ app.layout = html.Div(
                         html.Div(
                             style={
                                 "display": "grid",
-                                "gridTemplateColumns": "repeat(auto-fit, minmax(280px, 1fr))",
+                                "gridTemplateColumns": "repeat(3, minmax(0, 1fr))",
                                 "gap": "10px",
                                 "alignItems": "start",
                             },
@@ -2094,6 +2260,8 @@ app.layout = html.Div(
                                 dcc.Graph(id="ab-quality-graph", style={"height": "360px"}),
                                 dcc.Graph(id="ab-dropin-graph", style={"height": "360px"}),
                                 dcc.Graph(id="ab-violin-graph", style={"height": "360px"}),
+                                dcc.Graph(id="ab-quality-violin-graph", style={"height": "360px"}),
+                                dcc.Graph(id="ab-dropin-violin-graph", style={"height": "360px"}),
                             ],
                         ),
                         dcc.Graph(id="ab-failure-heatmap-graph"),
@@ -3770,6 +3938,8 @@ def update_leaderboard_content(
     Output("ab-dropin-graph", "figure"),
     Output("ab-failure-heatmap-graph", "figure"),
     Output("ab-violin-graph", "figure"),
+    Output("ab-quality-violin-graph", "figure"),
+    Output("ab-dropin-violin-graph", "figure"),
     Output("performance-graph", "figure"),
     Output("quality-score-graph", "figure"),
     Output("dropin-ratio-graph", "figure"),
@@ -3836,13 +4006,15 @@ def update_analysis(
         return (
             [],
             [],
-            "Add policy rows to start analysis.",
+            "Load policy rows to start analysis.",
             ab_common_legend_default,
             _empty_figure("Pick two policies for A/B plot"),
             _empty_figure("No quality score data for selected A/B policies"),
             _empty_figure("No drop-in attempt data for selected A/B policies"),
             _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps"),
             _empty_figure("Pick two policies for posterior uncertainty view"),
+            _empty_figure("Pick two policies for A/B quality posterior view"),
+            _empty_figure("Pick two policies for A/B drop-in posterior view"),
             _empty_figure("No policy data"),
             _empty_figure("No quality score data for selected policies"),
             _empty_figure("No drop-in ratio data for selected policies (lower is better)"),
@@ -3875,6 +4047,8 @@ def update_analysis(
             _empty_figure("No drop-in attempt data for selected A/B policies"),
             _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps"),
             _empty_figure("Pick two concluded policies for posterior uncertainty view"),
+            _empty_figure("Pick two concluded policies for quality posterior view"),
+            _empty_figure("Pick two concluded policies for drop-in posterior view"),
             _empty_figure("No concluded policies selected"),
             _empty_figure("No quality score data for selected policies"),
             _empty_figure("No drop-in ratio data for selected policies (lower is better)"),
@@ -3971,6 +4145,8 @@ def update_analysis(
     ab_dropin_fig = _empty_figure("No drop-in attempt data for selected A/B policies")
     ab_failure_heatmap_fig = _failure_empty_figure("Load detailed rollout sheets to compare A/B condition heatmaps")
     ab_violin_fig = _empty_figure("Pick two policies for A/B posterior view")
+    ab_quality_violin_fig = _empty_figure("Pick two policies for A/B quality posterior view")
+    ab_dropin_violin_fig = _empty_figure("Pick two policies for A/B drop-in posterior view")
 
     if policy_a and policy_b and policy_a in set(metrics["model_name"]) and policy_b in set(metrics["model_name"]):
         row_a = metrics.loc[metrics["model_name"] == policy_a].iloc[0]
@@ -4026,6 +4202,11 @@ def update_analysis(
 
         ab_policies = [policy_a, policy_b]
         ab_df = metrics.set_index("model_name").loc[ab_policies].reset_index()
+        _ab_short_names = [display_map.get(n, n) for n in ab_df["model_name"]]
+        ab_quality_letters = {policy_a: "a", policy_b: "a"}
+        ab_dropin_letters = {policy_a: "a", policy_b: "a"}
+        ab_quality_violin_fig = _empty_figure("No quality-score uncertainty data for selected A/B policies")
+        ab_dropin_violin_fig = _empty_figure("No drop-in uncertainty data for selected A/B policies")
         _legend_entries = []
         for label, policy_name, role in [
             ("Policy A", policy_a, "base"),
@@ -4179,11 +4360,13 @@ def update_analysis(
                         _qcolor = "#2e7d32"
                         q_better = True
                         q_worse = False
+                        ab_quality_letters[policy_b] = "b"
                     elif _dch < 0:
                         _qdec = "B has significantly lower quality."
                         _qcolor = "#c62828"
                         q_better = False
                         q_worse = True
+                        ab_quality_letters[policy_b] = "b"
                     else:
                         _qdec = "Inconclusive quality difference."
                         _qcolor = "#9e9e9e"
@@ -4202,6 +4385,25 @@ def update_analysis(
                         ],
                         style=ab_metric_card_style,
                     )
+
+                ab_quality_violin_fig = _build_quality_posterior_violin(
+                    ab_df,
+                    ab_quality_letters,
+                    policy_colors,
+                    "",
+                    display_names=display_map,
+                )
+                ab_quality_violin_fig.update_layout(
+                    height=320,
+                    margin={"l": 45, "r": 20, "t": 20, "b": 30},
+                    title=None,
+                    violingap=0.0,
+                    violingroupgap=0.0,
+                )
+                ab_quality_violin_fig.update_traces(width=0.9, selector={"type": "violin"})
+                ab_quality_violin_fig.update_xaxes(categoryorder="array", categoryarray=_ab_short_names)
+                ab_quality_violin_fig.update_xaxes(showticklabels=False, title_text="")
+                ab_quality_violin_fig.update_yaxes(title_text="Quality Score [%] ↑")
 
         # ── Attempt drop-in ratio A/B ──────────────────────────────────
         if "dropin_ratio_pct" in ab_df.columns and pd.to_numeric(ab_df["dropin_ratio_pct"], errors="coerce").notna().any():
@@ -4267,13 +4469,34 @@ def update_analysis(
                 _didec = "B has significantly lower drop-in ratio (better)."
                 _dicolor = "#2e7d32"
                 di_better = True
+                ab_dropin_letters[policy_b] = "b"
             elif _di_dlow > 0:
                 _didec = "B has significantly higher drop-in ratio (worse)."
                 _dicolor = "#c62828"
                 di_worse = True
+                ab_dropin_letters[policy_b] = "b"
             else:
                 _didec = "Inconclusive drop-in ratio difference."
                 _dicolor = "#9e9e9e"
+
+            ab_dropin_violin_fig = _build_dropin_posterior_violin(
+                ab_df,
+                ab_dropin_letters,
+                policy_colors,
+                "",
+                display_names=display_map,
+            )
+            ab_dropin_violin_fig.update_layout(
+                height=320,
+                margin={"l": 45, "r": 20, "t": 20, "b": 30},
+                title=None,
+                violingap=0.0,
+                violingroupgap=0.0,
+            )
+            ab_dropin_violin_fig.update_traces(width=0.9, selector={"type": "violin"})
+            ab_dropin_violin_fig.update_xaxes(categoryorder="array", categoryarray=_ab_short_names)
+            ab_dropin_violin_fig.update_xaxes(showticklabels=False, title_text="")
+            ab_dropin_violin_fig.update_yaxes(title_text="Drop-in Attempt [%] ↓")
 
             dropin_card = html.Div(
                 [
@@ -4352,7 +4575,6 @@ def update_analysis(
             "",
             display_names=display_map,
         )
-        _ab_short_names = [display_map.get(policy_a, policy_a), display_map.get(policy_b, policy_b)]
         ab_violin_fig.update_layout(
             height=320,
             margin={"l": 45, "r": 20, "t": 20, "b": 30},
@@ -4820,6 +5042,8 @@ def update_analysis(
         ab_dropin_fig,
         ab_failure_heatmap_fig,
         ab_violin_fig,
+        ab_quality_violin_fig,
+        ab_dropin_violin_fig,
         fig,
         quality_fig,
         dropin_fig,
