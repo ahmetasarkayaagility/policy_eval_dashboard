@@ -1632,9 +1632,6 @@ app.layout = html.Div(
                                                 dcc.Dropdown(id="sheet-name-dropdown", options=[], value=None, clearable=False, disabled=True),
                                             ],
                                         ),
-                                        html.Button("Add Row", id="add-row-btn"),
-                                        html.Button("Download CSV", id="download-btn"),
-                                        dcc.Download(id="download-csv"),
                                     ],
                                 ),
                                 html.Div(
@@ -1673,16 +1670,6 @@ app.layout = html.Div(
                             ],
                         ),
                         html.Div(id="load-status", style={"marginTop": "8px"}),
-                        dash_table.DataTable(
-                            id="raw-table",
-                            columns=_default_columns(),
-                            data=[],
-                            editable=True,
-                            row_deletable=True,
-                            page_size=12,
-                            style_table={"overflowX": "auto", "marginTop": "8px"},
-                            style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
-                        ),
                         html.Hr(),
                         html.H4("Analysis settings"),
                         html.Div(
@@ -1697,16 +1684,6 @@ app.layout = html.Div(
                                 ),
                             ],
                         ),
-                        html.H4("Per-policy intervals (success rate & quality)"),
-                        dash_table.DataTable(
-                            id="summary-table",
-                            columns=[],
-                            data=[],
-                            page_size=12,
-                            style_table={"overflowX": "auto"},
-                            style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
-                        ),
-                        html.Hr(),
                         html.H4("A/B comparison (base vs experimental)"),
                         html.Div(
                             style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px", "maxWidth": "760px"},
@@ -1742,6 +1719,38 @@ app.layout = html.Div(
                             ],
                         ),
                         dcc.Graph(id="ab-failure-heatmap-graph"),
+                        html.Hr(),
+                        dcc.Checklist(
+                            id="show-raw-table-toggle",
+                            options=[{"label": "Show loaded source table (optional sanity check)", "value": "show"}],
+                            value=[],
+                            inline=True,
+                            style={"marginTop": "4px"},
+                        ),
+                        html.Div(
+                            id="raw-table-wrapper",
+                            style={"display": "none", "marginTop": "8px"},
+                            children=[
+                                html.Div(
+                                    style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"},
+                                    children=[
+                                        html.Button("Add Row", id="add-row-btn"),
+                                        html.Button("Download CSV", id="download-btn"),
+                                        dcc.Download(id="download-csv"),
+                                    ],
+                                ),
+                                dash_table.DataTable(
+                                    id="raw-table",
+                                    columns=_default_columns(),
+                                    data=[],
+                                    editable=True,
+                                    row_deletable=True,
+                                    page_size=12,
+                                    style_table={"overflowX": "auto", "marginTop": "8px"},
+                                    style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
+                                ),
+                            ],
+                        ),
                     ],
                 ),
                 html.Div(
@@ -1903,6 +1912,29 @@ app.layout = html.Div(
                             style={"marginTop": "8px"},
                         ),
                         html.Div(id="allvsall-violin-wrapper", children=[dcc.Graph(id="allvsall-violin-graph")]),
+                        html.Hr(),
+                        dcc.Checklist(
+                            id="show-summary-table-toggle",
+                            options=[{"label": "Show per-policy interval details", "value": "show"}],
+                            value=[],
+                            inline=True,
+                            style={"marginTop": "8px"},
+                        ),
+                        html.Div(
+                            id="summary-table-wrapper",
+                            style={"display": "none", "marginTop": "8px"},
+                            children=[
+                                html.H4("Per-policy intervals (detailed)"),
+                                dash_table.DataTable(
+                                    id="summary-table",
+                                    columns=[],
+                                    data=[],
+                                    page_size=12,
+                                    style_table={"overflowX": "auto"},
+                                    style_cell={"textAlign": "left", "fontFamily": "sans-serif", "fontSize": 13},
+                                ),
+                            ],
+                        ),
                     ],
                 ),
             ],
@@ -2076,6 +2108,26 @@ def toggle_pages(active_tab: str | None):
     if active_tab == "leaderboard":
         return {"display": "block"}, {"display": "none"}, {"display": "block"}, {"display": "none"}
     return {"display": "block"}, {"display": "block"}, {"display": "none"}, {"display": "none"}
+
+
+@app.callback(
+    Output("raw-table-wrapper", "style"),
+    Input("show-raw-table-toggle", "value"),
+)
+def toggle_raw_table_wrapper(show_toggle: list[str] | None):
+    if "show" in (show_toggle or []):
+        return {"display": "block", "marginTop": "8px"}
+    return {"display": "none", "marginTop": "8px"}
+
+
+@app.callback(
+    Output("summary-table-wrapper", "style"),
+    Input("show-summary-table-toggle", "value"),
+)
+def toggle_summary_table_wrapper(show_toggle: list[str] | None):
+    if "show" in (show_toggle or []):
+        return {"display": "block", "marginTop": "8px"}
+    return {"display": "none", "marginTop": "8px"}
 
 
 @app.callback(
@@ -3662,6 +3714,18 @@ def update_analysis(
         "Select Policy A and Policy B to show shared color legend.",
         style={"fontSize": "12px", "color": "#666"},
     )
+    ab_metric_card_style = {
+        "background": "#fafafa",
+        "border": "1px solid #e0e0e0",
+        "borderRadius": "6px",
+        "padding": "8px 10px",
+    }
+    ab_overall_card_style = {
+        "background": "#f5f5f5",
+        "border": "1px solid #bdbdbd",
+        "borderRadius": "6px",
+        "padding": "8px 10px",
+    }
 
     if clean_df.empty:
         return (
@@ -3768,19 +3832,19 @@ def update_analysis(
         summary["quality_ci_high"] = _qci[1].round(2)
         summary["quality_score_std_pct"] = pd.to_numeric(metrics["quality_score_std_pct"], errors="coerce").round(2)
     summary_columns = [
-        {"name": "model_name", "id": "model_name"},
-        {"name": "successes", "id": "successes"},
-        {"name": "trials", "id": "trials"},
-        {"name": "success_rate_%", "id": "success_rate"},
-        {"name": "wilson_low_%", "id": "wilson_low"},
-        {"name": "wilson_high_%", "id": "wilson_high"},
+        {"name": "Policy", "id": "model_name"},
+        {"name": "Successes", "id": "successes"},
+        {"name": "Trials", "id": "trials"},
+        {"name": "SR [%]", "id": "success_rate"},
+        {"name": "SR CI Low [%]", "id": "wilson_low"},
+        {"name": "SR CI High [%]", "id": "wilson_high"},
     ]
     if "quality_score_pct" in summary.columns:
-        summary_columns.append({"name": "quality_score_%", "id": "quality_score_pct"})
+        summary_columns.append({"name": "Quality [%]", "id": "quality_score_pct"})
     if has_quality_std:
-        summary_columns.append({"name": "quality_std_%", "id": "quality_score_std_pct"})
-        summary_columns.append({"name": "quality_ci_low_%", "id": "quality_ci_low"})
-        summary_columns.append({"name": "quality_ci_high_%", "id": "quality_ci_high"})
+        summary_columns.append({"name": "Quality STD", "id": "quality_score_std_pct"})
+        summary_columns.append({"name": "Q CI Low [%]", "id": "quality_ci_low"})
+        summary_columns.append({"name": "Q CI High [%]", "id": "quality_ci_high"})
     if has_dropin:
         summary["dropin_ratio_pct"] = pd.to_numeric(metrics["dropin_ratio_pct"], errors="coerce").round(2)
         _di_count = pd.to_numeric(metrics.get("dropin_count"), errors="coerce").fillna(0).astype(int)
@@ -3791,9 +3855,9 @@ def update_analysis(
         )
         summary["dropin_wilson_low"] = (_di_ci["dropin_wilson_low"] * 100).round(2)
         summary["dropin_wilson_high"] = (_di_ci["dropin_wilson_high"] * 100).round(2)
-        summary_columns.append({"name": "dropin_%_lower_better", "id": "dropin_ratio_pct"})
-        summary_columns.append({"name": "dropin_ci_low_%_lower_better", "id": "dropin_wilson_low"})
-        summary_columns.append({"name": "dropin_ci_high_%_lower_better", "id": "dropin_wilson_high"})
+        summary_columns.append({"name": "Drop-in [%] ↓", "id": "dropin_ratio_pct"})
+        summary_columns.append({"name": "Drop-in CI Low [%]", "id": "dropin_wilson_low"})
+        summary_columns.append({"name": "Drop-in CI High [%]", "id": "dropin_wilson_high"})
 
     ab_output = "Pick two policies to compare."
     ab_common_legend = ab_common_legend_default
@@ -3841,23 +3905,18 @@ def update_analysis(
 
         ab_output = html.Div(
             [
-                html.Div("Success Rate", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                html.Div("SR [%] ↑", style={"fontWeight": "600", "fontSize": "13px", "marginBottom": "2px"}),
                 html.Div(
                     f"\u0394 (B \u2212 A): {delta * 100:.2f} pp | "
-                    f"{confidence_level * 100:.0f}% CI: [{delta_low * 100:.2f}, {delta_high * 100:.2f}] pp"
+                    f"CI: [{delta_low * 100:.2f}, {delta_high * 100:.2f}] pp",
+                    style={"fontSize": "12px"},
                 ),
                 html.Div(
                     decision,
-                    style={"fontWeight": "bold", "marginTop": "4px", "color": decision_color},
+                    style={"fontWeight": "600", "marginTop": "2px", "color": decision_color, "fontSize": "12px"},
                 ),
             ],
-            style={
-                "background": "#fafafa",
-                "border": "1px solid #e0e0e0",
-                "borderRadius": "6px",
-                "padding": "12px 16px",
-                "marginTop": "10px",
-            },
+            style=ab_metric_card_style,
         )
 
         ab_policies = [policy_a, policy_b]
@@ -4028,20 +4087,15 @@ def update_analysis(
 
                     quality_card = html.Div(
                         [
-                            html.Div("Quality Score", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                            html.Div("Quality [%] ↑", style={"fontWeight": "600", "fontSize": "13px", "marginBottom": "2px"}),
                             html.Div(
                                 f"\u0394 (B \u2212 A): {_dq:.2f} pp, "
-                                f"{confidence_level * 100:.0f}% CI: [{_dcl:.2f}, {_dch:.2f}] pp"
+                                f"CI: [{_dcl:.2f}, {_dch:.2f}] pp",
+                                style={"fontSize": "12px"},
                             ),
-                            html.Div(_qdec, style={"fontWeight": "bold", "marginTop": "4px", "color": _qcolor}),
+                            html.Div(_qdec, style={"fontWeight": "600", "marginTop": "2px", "color": _qcolor, "fontSize": "12px"}),
                         ],
-                        style={
-                            "background": "#fafafa",
-                            "border": "1px solid #e0e0e0",
-                            "borderRadius": "6px",
-                            "padding": "12px 16px",
-                            "marginTop": "10px",
-                        },
+                        style=ab_metric_card_style,
                     )
 
         # ── Attempt drop-in ratio A/B ──────────────────────────────────
@@ -4118,20 +4172,15 @@ def update_analysis(
 
             dropin_card = html.Div(
                 [
-                    html.Div("Drop-in Attempt [%] ↓", style={"fontWeight": "bold", "marginBottom": "4px"}),
+                    html.Div("Drop-in [%] ↓", style={"fontWeight": "600", "fontSize": "13px", "marginBottom": "2px"}),
                     html.Div(
                         f"\u0394 (B \u2212 A): {_di_delta * 100:.2f} pp, "
-                        f"{confidence_level * 100:.0f}% CI: [{_di_dlow * 100:.2f}, {_di_dhigh * 100:.2f}] pp"
+                        f"CI: [{_di_dlow * 100:.2f}, {_di_dhigh * 100:.2f}] pp",
+                        style={"fontSize": "12px"},
                     ),
-                    html.Div(_didec, style={"fontWeight": "bold", "marginTop": "4px", "color": _dicolor}),
+                    html.Div(_didec, style={"fontWeight": "600", "marginTop": "2px", "color": _dicolor, "fontSize": "12px"}),
                 ],
-                style={
-                    "background": "#fafafa",
-                    "border": "1px solid #e0e0e0",
-                    "borderRadius": "6px",
-                    "padding": "12px 16px",
-                    "marginTop": "10px",
-                },
+                style=ab_metric_card_style,
             )
 
         # ── Combined verdict ───────────────────────────────────────────
@@ -4169,14 +4218,8 @@ def update_analysis(
                 _oc = "#9e9e9e"
 
             overall_card = html.Div(
-                html.Div(_ov, style={"fontWeight": "bold", "color": _oc}),
-                style={
-                    "background": "#f5f5f5",
-                    "border": "1px solid #bdbdbd",
-                    "borderRadius": "6px",
-                    "padding": "10px 16px",
-                    "marginTop": "10px",
-                },
+                html.Div(_ov, style={"fontWeight": "600", "color": _oc, "fontSize": "12px"}),
+                style=ab_overall_card_style,
             )
             _cards = [ab_output]
             if quality_card is not None:
@@ -4184,7 +4227,7 @@ def update_analysis(
             if dropin_card is not None:
                 _cards.append(dropin_card)
             _cards.append(overall_card)
-            ab_output = html.Div(_cards)
+            ab_output = html.Div(_cards, style={"display": "grid", "gap": "6px"})
 
         ab_pair_letters = base_vs_policy_letter_pairs(
             ab_df,

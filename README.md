@@ -12,9 +12,11 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Choose which sheet/tab to load when an XLSX file contains multiple sheets.
 - Reuse a default Google Sheets URL via `DEFAULT_GOOGLE_SHEET_URL`.
 - Edit/log rollout rows in-app.
+- Optional source-data sanity table on A/B page bottom (`Show loaded source table`).
 - Compute per-policy Wilson confidence intervals for success rates.
 - Compute per-policy quality-score confidence intervals (t-distribution) when a `Quality Score STD [%]` column is present.
 - Compute per-policy attempt-drop-in Wilson confidence intervals when an `Attempt to drop in Ratio [%]` column is present (binary proportion, lower is better).
+- Detailed per-policy interval table is shown on Leaderboard page bottom (`Show per-policy interval details`).
 - **Common prefix stripping**: automatically detects and removes the longest shared prefix (at `_` or `-` boundaries) from policy names for cleaner visuals; the stripped prefix is shown once in status/legend context instead of repeating it in every plot title.
 - Compare two policies (A/B) with:
   - Compact delta + CI summary (one line per metric)
@@ -145,7 +147,8 @@ Optional env vars:
   - **Local file**: export `CSV`/`XLSX` and click `Upload CSV/XLSX`.
   - **Google link**: paste the spreadsheet URL and click `Load/Refresh Google Sheet`.
 2. If the source has multiple tabs, use the `Sheet` dropdown to select the tab you want to analyze.
-3. Review/edit rows in the table and continue with analysis.
+3. In `A/B Testing`, run pairwise comparisons and optionally expand `Show loaded source table` at the bottom for sanity checking/editing.
+4. In `Leaderboard`, optionally expand `Show per-policy interval details` at the bottom for full CI/interval values.
 
 Failure analysis workflow:
 
