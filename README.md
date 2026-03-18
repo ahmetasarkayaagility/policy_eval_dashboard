@@ -11,7 +11,7 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Supports hidden Google hyperlink cells in `Eval Details` (including `HYPERLINK(...)` formulas) and extracts them into `eval_details_url` for downstream rollout-detail analysis.
 - Choose which sheet/tab to load when an XLSX file contains multiple sheets.
 - Reuse a default Google Sheets URL via `DEFAULT_GOOGLE_SHEET_URL`.
-- Edit/log rollout rows in-app.
+- Edit loaded rollout rows in-app and export a CSV snapshot.
 - Optional source-data sanity table on A/B page bottom (`Show loaded source table`).
 - Compute per-policy Wilson confidence intervals for success rates.
 - Compute per-policy quality-score confidence intervals (t-distribution) when a `Quality Score STD [%]` column is present.
@@ -85,11 +85,11 @@ This script:
 
 The app uses this order for auth, to keep sign-in as frictionless as possible:
 
-1. **Application Default Credentials (ADC)** (best for company-managed setups).
+1. **Application Default Credentials (ADC)** (lowest friction when already configured).
 2. **Cached OAuth token** from a previous sign-in.
 3. **Interactive OAuth browser popup** (first-time fallback).
 
-#### Option A — Company users via ADC (least friction)
+#### Option A — ADC (least friction)
 
 Install Google Cloud SDK (Ubuntu/Debian):
 
@@ -115,7 +115,7 @@ Create/download OAuth client JSON:
 
 1. Open `https://console.cloud.google.com/apis/library/sheets.googleapis.com` and enable **Google Sheets API**.
 2. Open `https://console.cloud.google.com/apis/credentials`.
-3. Configure OAuth consent screen as **Internal** (company workspace) if applicable.
+3. Configure OAuth consent screen as **Internal** (workspace-only) if applicable.
 4. Click **Create Credentials → OAuth client ID → Desktop app**.
 5. Download the JSON file.
 
@@ -147,7 +147,7 @@ Optional env vars:
   - **Local file**: export `CSV`/`XLSX` and click `Upload CSV/XLSX`.
   - **Google link**: paste the spreadsheet URL and click `Load/Refresh Google Sheet`.
 2. If the source has multiple tabs, use the `Sheet` dropdown to select the tab you want to analyze.
-3. In `A/B Testing`, run pairwise comparisons and optionally expand `Show loaded source table` at the bottom for sanity checking/editing.
+3. In `A/B Testing`, run pairwise comparisons and optionally expand `Show loaded source table` at the bottom for sanity checking/editing/deleting rows.
 4. In `Leaderboard`, optionally expand `Show per-policy interval details` at the bottom for full CI/interval values.
 
 Failure analysis workflow:
@@ -227,6 +227,57 @@ Refactor guidelines used in this repo:
 - Keep parsing and column-matching helpers in `data_utils.py` and reuse them from the app layer to avoid drift.
 - Keep statistical formulas isolated in `stats_utils.py` so UI/callback code stays presentation-focused.
 - Prefer stable sort/order semantics (`kind="stable"`) in ranking displays to keep ties deterministic.
+
+## Developer architecture guide
+
+### End-to-end data flow
+
+1. **Ingestion** (`load_file_to_table` in `app.py`):
+   - loads local/Google sheet data,
+   - normalizes it through `normalize_policy_dataframe`,
+   - stores normalized records in `raw-table`.
+2. **Normalization for analytics** (`_raw_to_clean_df` in `app.py`):
+   - standardizes metrics (`successes`, `trials`, `%` scaling, drop-in counts),
+   - merges testing-group tags,
+   - keeps deterministic source ordering.
+3. **View callbacks**:
+   - `update_analysis` drives A/B and multi-policy figures/tables,
+   - `update_leaderboard_content` drives leaderboard + base-vs summaries,
+   - `update_failure_views` drives failure-mode aggregate/pairwise heatmaps + highlights.
+
+### Key callback responsibilities
+
+- `sync_policy_selectors` and `sync_failure_policy_selectors`:
+  - keep dropdowns/checklists coherent after load/filter actions,
+  - enforce `Select All` / `Deselect All` / testing-group behavior.
+- `update_analysis`:
+  - computes primary statistical results from selected policies,
+  - owns CLD/violin/scatter output composition.
+- `update_leaderboard_content`:
+  - computes ranking rows and base-vs significant metric summaries.
+- `update_failure_views`:
+  - resolves condition axes,
+  - builds grouped/aggregate failure frames,
+  - renders aggregate + pairwise condition comparisons.
+
+### Where to add new functionality
+
+- **New column aliases/parsing rules** → `data_utils.py` constants + parsing helpers.
+- **New statistical test/interval method** → `stats_utils.py` only; expose clean outputs to `app.py`.
+- **New UI control or figure** → layout in `app.py`, then wire through one dedicated callback path.
+- **Failure-mode metric extension**:
+  - add option in `FAILURE_METRIC_OPTIONS`,
+  - update failure metric resolution helper,
+  - keep table/highlight formatting consistent with existing metric keys.
+
+### Maintenance checklist for future changes
+
+- Keep `raw-table` schema backward-compatible (`model_name`, `successes`, `trials` are core).
+- Keep sort operations stable (`kind="stable"`) for deterministic tie behavior.
+- Reuse helper functions before adding callback-local duplicate logic.
+- Validate quickly with:
+  - `python -m py_compile app.py data_utils.py stats_utils.py`
+  - a smoke run of local upload, Google load, A/B page, Leaderboard page, and Failure page.
 
 ## Performance notes
 
