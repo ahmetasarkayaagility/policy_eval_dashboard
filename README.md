@@ -4,6 +4,7 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 
 ## Features
 
+- Three-page navigation: `A/B Testing`, `Leaderboard`, and `Failure Mode Analysis`.
 - Upload a local CSV/XLSX file (e.g., downloaded from Google Sheets).
 - Paste a Google Sheets URL and load/refresh directly in-app (no manual XLSX export needed).
 - Shows a small in-app Google auth status hint (`ready` / `needs sign-in`) near the Google URL field.
@@ -11,16 +12,20 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Choose which sheet/tab to load when an XLSX file contains multiple sheets.
 - Reuse a default Google Sheets URL via `DEFAULT_GOOGLE_SHEET_URL`.
 - Edit/log rollout rows in-app.
+- Optional source-data sanity table on A/B page bottom (`Show loaded source table`).
 - Compute per-policy Wilson confidence intervals for success rates.
 - Compute per-policy quality-score confidence intervals (t-distribution) when a `Quality Score STD [%]` column is present.
 - Compute per-policy attempt-drop-in Wilson confidence intervals when an `Attempt to drop in Ratio [%]` column is present (binary proportion, lower is better).
-- **Common prefix stripping**: automatically detects and removes the longest shared prefix (at `_` or `-` boundaries) from policy names in all charts, violins, and CLD table for cleaner visuals. The stripped prefix is shown in chart subtitles and the sort-status bar.
+- Detailed per-policy interval table is shown on Leaderboard page bottom (`Show per-policy interval details`).
+- **Common prefix stripping**: automatically detects and removes the longest shared prefix (at `_` or `-` boundaries) from policy names for cleaner visuals; the stripped prefix is shown once in status/legend context instead of repeating it in every plot title.
 - Compare two policies (A/B) with:
   - Compact delta + CI summary (one line per metric)
   - Color-coded verdict per metric: **green** (better), **red** (worse), **gray** (inconclusive)
   - **Combined overall verdict** synthesizing success-rate, quality, and drop-in signals (trade-offs, agreements, mixed signals)
+  - Shared A/B color legend shown once and reused across all A/B plots
+  - Cleaner compact plots: policy names are not repeated on each x-axis; metric axes carry context
   - Four compact side-by-side A/B plots: success rate, quality score, attempt drop-in, and posterior violin
-  - A/B attempt drop-in ratio chart uses no intra-bar gaps for compactness
+  - Drop-in labels use arrow semantics (`↓`) like leaderboard views
   - A/B condition heatmap comparison (side-by-side) with shared Y-axis labels and red/green success coloring
   - Posterior violin plot (Bayesian uncertainty) in compact width/height to reduce white space
 - Compare multiple policies with base-vs-policy pair letters.
@@ -35,7 +40,7 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
 - Keep original sheet order by default, with optional sorting by success rate, `Quality Score [%]`, or `Attempt Drop-in Ratio [%]`.
 - **Dedicated Failure Mode Analysis page/tab** with rollout-level diagnostics sourced from per-policy detail sheet links.
 - **Single aggregate failure heatmap** for fast condition scanning: one grayscale heatmap averaged across completed policies with metric switch (`failure`, `success`, `quality`, `n`), per-cell value labels, and optional ordering (`Original spreadsheet order` default, or `failure severity`).
-- **Main-page failure highlights**: compact hardest/easiest condition highlights from aggregate failure analysis.
+- **Failure-page top highlights**: compact hardest/easiest condition highlights shown before detailed heatmaps.
 - **Axis-aggregated condition heatmaps**: separate grayscale heatmaps for stack conditions (aggregated over robot conditions) and robot conditions (aggregated over stack conditions), with per-cell value labels and the same optional ordering mode.
 - **Selected-policy failure comparisons**: choose two policies and render smaller side-by-side comparisons for (1) full condition grid, (2) stack-axis aggregate, and (3) robot-axis aggregate.
 - **Top hardest + easiest conditions** tables for quick best/worst condition lookup.
@@ -142,15 +147,17 @@ Optional env vars:
   - **Local file**: export `CSV`/`XLSX` and click `Upload CSV/XLSX`.
   - **Google link**: paste the spreadsheet URL and click `Load/Refresh Google Sheet`.
 2. If the source has multiple tabs, use the `Sheet` dropdown to select the tab you want to analyze.
-3. Review/edit rows in the table and continue with analysis.
+3. In `A/B Testing`, run pairwise comparisons and optionally expand `Show loaded source table` at the bottom for sanity checking/editing.
+4. In `Leaderboard`, optionally expand `Show per-policy interval details` at the bottom for full CI/interval values.
 
 Failure analysis workflow:
 
 1. Open the `Failure Mode Analysis` tab.
-2. Load/refresh spreadsheet data from the `Main Dashboard` (`Upload CSV/XLSX` or `Load/Refresh Google Sheet`).
+2. Load/refresh spreadsheet data from the `A/B Testing` tab (`Upload CSV/XLSX` or `Load/Refresh Google Sheet`).
 3. The app automatically reads per-policy detail URLs from `eval_details_url` / `Eval Details` and loads rollout sheets for failure analysis.
   - Rows without a specified success-rate value are treated as planning rows and skipped.
 4. Choose a metric and inspect:
+  - top-level failure highlights (hardest/easiest conditions),
   - the full aggregate grayscale condition heatmap,
   - stack-condition aggregate heatmap,
   - robot-condition aggregate heatmap,
