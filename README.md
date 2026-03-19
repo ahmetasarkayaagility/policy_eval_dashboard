@@ -29,7 +29,7 @@ Minimal interactive dashboard for tracking robot policy rollout experiments from
   - A/B condition heatmap comparison (side-by-side) with shared Y-axis labels and red/green success coloring
   - Posterior violin plot (Bayesian uncertainty) in compact width/height to reduce white space
 - Compare multiple policies with base-vs-policy pair letters.
-- **Testing Group tag filtering**: supports single or multi-tag values per policy row and multi-select filtering in UI; `Plot Tag + Base` selects policies matching any chosen tags plus rows tagged as `Base`/`Default`/`Baseline`/`Control`.
+- **Testing Group tag filtering**: supports single or multi-tag values per policy row and multi-select filtering in UI; `Plot Tag + Base` selects policies matching any chosen tags plus rows tagged as `Base`/`Default`/`Baseline`/`Control`, and leaderboard has its own `Leaderboard Tag + Base` / `Clear Leaderboard Tag Filter` controls for ranking-only filtering.
 - **Success Rate vs Quality Score scatter plot**: each policy is a point at (SR%, Quality%) with Wilson CI horizontal bars and quality CI vertical bars, enabling quick Pareto-style comparison.
 - Visualize posterior uncertainty using Bayesian violins in a final optional panel that compares base-vs-policy pairs (`base vs candidate`) with pair letters (`a-a` / `a-b`).
 - Plot selected policy success rates with Wilson CI error bars.
@@ -179,7 +179,11 @@ Under multi-policy comparison:
 
 - Use `Original Order`, `Sort by Success Rate`, `Sort by Quality Score [%]`, and `Sort by Attempt Drop-in` to control policy order.
 - If your sheet contains `Testing Group`, you can choose one or more tags and click `Plot Tag + Base` to plot matching policies plus base-tagged rows.
+- In `Policy leaderboard`, use `Leaderboard Tag + Base` to filter ranking rows by selected tag(s) plus base rows without changing plot selection.
+- The leaderboard filter status line shows active leaderboard tags; default state is `all`.
+- Use `Policies per page` on leaderboard to switch between `15` (default) and `50` rows.
 - Use `Clear Tag Filter` to go back to normal manual policy selection.
+- Use `Clear Leaderboard Tag Filter` to remove leaderboard-only tag filtering.
 - When your source sheet has a success-rate column and some rows are empty, those policies are auto-deselected from initial plotting.
 - Quality score values in `[0, 1]` are automatically converted to percentage points `[0, 100]` for display and sorting.
 
@@ -247,7 +251,7 @@ Refactor guidelines used in this repo:
 
 ### Key callback responsibilities
 
-- `sync_policy_selectors` and `sync_failure_policy_selectors`:
+- `sync_policy_selectors`, `sync_leaderboard_testing_group_selector`, and `sync_failure_policy_selectors`:
   - keep dropdowns/checklists coherent after load/filter actions,
   - enforce `Select All` / `Deselect All` / testing-group behavior.
 - `update_analysis`:
