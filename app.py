@@ -270,6 +270,41 @@ def _build_testing_group_index(
     return tag_order, group_to_models, base_models
 
 
+def _build_testing_group_index_for_models(
+    clean_df: pd.DataFrame,
+    model_names: list[str],
+) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    """Build testing-group index for a filtered model set from normalized rows."""
+    tag_df = clean_df.copy()
+    if not tag_df.empty:
+        tag_df = tag_df[tag_df["model_name"].astype(str).isin(model_names)].copy()
+        tag_df = tag_df.sort_values("source_order", kind="stable")
+
+    if "testing_group_tags" not in tag_df.columns:
+        if "testing_group" in tag_df.columns:
+            tag_df["testing_group_tags"] = tag_df["testing_group"].map(_split_testing_group_tags)
+        else:
+            tag_df["testing_group_tags"] = [[] for _ in range(len(tag_df))]
+    if "is_base_group" not in tag_df.columns:
+        tag_df["is_base_group"] = False
+    tag_df["is_base_group"] = tag_df["is_base_group"].fillna(False).astype(bool)
+
+    group_entries: list[tuple[str, list[str], bool]] = []
+    for _, row in tag_df.iterrows():
+        model_name = str(row.get("model_name", "")).strip()
+        if not model_name:
+            continue
+
+        tags = row.get("testing_group_tags")
+        if not isinstance(tags, list):
+            tags = _split_testing_group_tags(tags)
+
+        row_is_base = bool(row.get("is_base_group", False)) or any(_is_base_group_tag(tag) for tag in tags)
+        group_entries.append((model_name, tags, row_is_base))
+
+    return _build_testing_group_index(group_entries)
+
+
 def _resolve_group_dropdown_state(
     trigger: str,
     selected_groups: list[str],
@@ -2131,6 +2166,7 @@ app.layout = html.Div(
         dcc.Store(id="uploaded-file-store", data=None),
         dcc.Store(id="sort-mode-store", data="original"),
         dcc.Store(id="active-testing-group-store", data=None),
+        dcc.Store(id="leaderboard-active-testing-group-store", data=None),
         dcc.Store(id="failure-active-testing-group-store", data=None),
         dcc.Store(
             id="failure-detail-store",
@@ -2305,6 +2341,48 @@ app.layout = html.Div(
                         html.H2("Leaderboard"),
                         html.P("Rank all policies and compare selected policies against the chosen base policy."),
                         html.H4("Policy leaderboard"),
+                        html.Div(
+                            style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap", "marginBottom": "8px"},
+                            children=[
+                                html.Div(
+                                    style={"minWidth": "260px", "maxWidth": "360px"},
+                                    children=[
+                                        html.Label("Testing Group", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Dropdown(
+                                            id="leaderboard-testing-group-dropdown",
+                                            options=[],
+                                            value=[],
+                                            multi=True,
+                                            clearable=True,
+                                            placeholder="Select tag(s)",
+                                            disabled=True,
+                                        ),
+                                    ],
+                                ),
+                                html.Button("Leaderboard Tag + Base", id="leaderboard-apply-testing-group-btn"),
+                                html.Button("Clear Leaderboard Tag Filter", id="leaderboard-clear-testing-group-btn"),
+                                html.Div(
+                                    style={"minWidth": "160px", "maxWidth": "180px"},
+                                    children=[
+                                        html.Label("Policies per page", style={"fontSize": "12px", "marginBottom": "2px"}),
+                                        dcc.Dropdown(
+                                            id="leaderboard-page-size-dropdown",
+                                            options=[
+                                                {"label": "15", "value": 15},
+                                                {"label": "50", "value": 50},
+                                            ],
+                                            value=15,
+                                            clearable=False,
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                        html.Div(
+                            id="leaderboard-tag-filter-status",
+                            children="Leaderboard tag filter: all",
+                            style={"fontSize": "12px", "color": "#666", "marginBottom": "6px"},
+                        ),
                         dash_table.DataTable(
                             id="leaderboard-table",
                             columns=[
@@ -3478,33 +3556,7 @@ def sync_policy_selectors(
     display_map, _pfx = _make_display_names(models)
     options = [{"label": display_map.get(model, model), "value": model} for model in models]
 
-    tag_df = clean_df.copy()
-    if not tag_df.empty:
-        tag_df = tag_df[tag_df["model_name"].astype(str).isin(models)].copy()
-        tag_df = tag_df.sort_values("source_order", kind="stable")
-    if "testing_group_tags" not in tag_df.columns:
-        if "testing_group" in tag_df.columns:
-            tag_df["testing_group_tags"] = tag_df["testing_group"].map(_split_testing_group_tags)
-        else:
-            tag_df["testing_group_tags"] = [[] for _ in range(len(tag_df))]
-    if "is_base_group" not in tag_df.columns:
-        tag_df["is_base_group"] = False
-    tag_df["is_base_group"] = tag_df["is_base_group"].fillna(False).astype(bool)
-
-    group_entries: list[tuple[str, list[str], bool]] = []
-    for _, row in tag_df.iterrows():
-        model_name = str(row.get("model_name", "")).strip()
-        if not model_name:
-            continue
-
-        tags = row.get("testing_group_tags")
-        if not isinstance(tags, list):
-            tags = _split_testing_group_tags(tags)
-
-        row_is_base = bool(row.get("is_base_group", False)) or any(_is_base_group_tag(tag) for tag in tags)
-        group_entries.append((model_name, tags, row_is_base))
-
-    tag_order, group_to_models, base_models = _build_testing_group_index(group_entries)
+    tag_order, group_to_models, base_models = _build_testing_group_index_for_models(clean_df, models)
 
     tag_options = [{"label": tag, "value": tag} for tag in tag_order]
     tag_set = set(tag_order)
@@ -3580,8 +3632,67 @@ def sync_policy_selectors(
 
 
 @app.callback(
+    Output("leaderboard-testing-group-dropdown", "options"),
+    Output("leaderboard-testing-group-dropdown", "value"),
+    Output("leaderboard-testing-group-dropdown", "disabled"),
+    Output("leaderboard-active-testing-group-store", "data"),
+    Input("raw-table", "data"),
+    Input("leaderboard-apply-testing-group-btn", "n_clicks"),
+    Input("leaderboard-clear-testing-group-btn", "n_clicks"),
+    State("leaderboard-testing-group-dropdown", "value"),
+    State("leaderboard-active-testing-group-store", "data"),
+)
+def sync_leaderboard_testing_group_selector(
+    rows: list[dict] | None,
+    _apply_clicks: int,
+    _clear_clicks: int,
+    selected_testing_group: list[str] | str | None,
+    current_active_group: list[str] | str | None,
+):
+    clean_df = _raw_to_clean_df(rows)
+    if "has_success_rate_input" in clean_df.columns and not clean_df.empty:
+        leaderboard_models = clean_df.loc[
+            clean_df["has_success_rate_input"].fillna(True), "model_name"
+        ].astype(str).tolist()
+    else:
+        leaderboard_models = clean_df["model_name"].astype(str).tolist() if not clean_df.empty else []
+
+    tag_order, _group_to_models, _base_models = _build_testing_group_index_for_models(clean_df, leaderboard_models)
+    tag_options = [{"label": tag, "value": tag} for tag in tag_order]
+    tag_set = set(tag_order)
+
+    trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else "raw-table"
+    selected_groups = [group for group in _normalize_group_selection(selected_testing_group) if group in tag_set]
+    active_groups = [group for group in _normalize_group_selection(current_active_group) if group in tag_set]
+
+    if trigger == "leaderboard-apply-testing-group-btn":
+        active_groups = selected_groups
+    elif trigger == "leaderboard-clear-testing-group-btn":
+        active_groups = []
+
+    dropdown_value, dropdown_disabled, active_groups = _resolve_group_dropdown_state(
+        trigger,
+        selected_groups,
+        active_groups,
+        tag_options,
+        clear_trigger_id="leaderboard-clear-testing-group-btn",
+    )
+
+    return tag_options, dropdown_value, dropdown_disabled, active_groups
+
+
+@app.callback(
+    Output("leaderboard-table", "page_size"),
+    Input("leaderboard-page-size-dropdown", "value"),
+)
+def update_leaderboard_page_size(page_size_value: int | str | None):
+    return 50 if str(page_size_value) == "50" else 15
+
+
+@app.callback(
     Output("leaderboard-table", "data"),
     Output("leaderboard-table", "style_data_conditional"),
+    Output("leaderboard-tag-filter-status", "children"),
     Output("base-vs-quality-violin-graph", "figure"),
     Output("base-vs-dropin-violin-graph", "figure"),
     Output("leaderboard-significant-pairs-table", "data"),
@@ -3591,6 +3702,7 @@ def sync_policy_selectors(
     Input("policy-a-dropdown", "value"),
     Input("policy-checklist", "value"),
     Input("active-testing-group-store", "data"),
+    Input("leaderboard-active-testing-group-store", "data"),
     Input("sort-mode-store", "data"),
 )
 def update_leaderboard_content(
@@ -3599,6 +3711,7 @@ def update_leaderboard_content(
     base_policy_selected: str | None,
     selected_policies: list[str] | None,
     active_testing_group: list[str] | str | None,
+    active_leaderboard_testing_group: list[str] | str | None,
     sort_mode: str | None,
 ):
     summary_columns = [
@@ -3618,6 +3731,7 @@ def update_leaderboard_content(
         return (
             [],
             [],
+            "Leaderboard tag filter: all",
             _empty_figure("No quality-score data for selected base-vs-policy pairs"),
             _empty_figure("No drop-in data for selected base-vs-policy pairs"),
             [],
@@ -3631,6 +3745,7 @@ def update_leaderboard_content(
     all_names = metrics["model_name"].astype(str).tolist()
     display_map, prefix = _make_display_names(all_names)
     active_group_values = _normalize_group_selection(active_testing_group)
+    active_leaderboard_group_values = _normalize_group_selection(active_leaderboard_testing_group)
 
     _suffix_parts: list[str] = []
     if active_group_values:
@@ -3646,6 +3761,29 @@ def update_leaderboard_content(
     leaderboard_df["success_rate_pct"] = pd.to_numeric(leaderboard_df["success_rate"], errors="coerce") * 100.0
     leaderboard_df["quality_score_pct"] = pd.to_numeric(leaderboard_df.get("quality_score_pct"), errors="coerce")
     leaderboard_df["dropin_ratio_pct"] = pd.to_numeric(leaderboard_df.get("dropin_ratio_pct"), errors="coerce")
+    applied_leaderboard_groups: list[str] = []
+
+    if active_leaderboard_group_values:
+        tag_order, group_to_models, base_models = _build_testing_group_index_for_models(clean_df, all_names)
+        tag_set = set(tag_order)
+        selected_leaderboard_groups = [group for group in active_leaderboard_group_values if group in tag_set]
+        if selected_leaderboard_groups:
+            applied_leaderboard_groups = selected_leaderboard_groups
+            if not base_models and base_policy_selected in all_names:
+                base_models = [str(base_policy_selected)]
+            selected_models = _select_models_for_group_tags(
+                selected_leaderboard_groups,
+                base_models,
+                group_to_models,
+                all_names,
+            )
+            leaderboard_df = leaderboard_df[leaderboard_df["model_name"].astype(str).isin(selected_models)].copy()
+
+    leaderboard_filter_status = (
+        f"Leaderboard tag filter: {', '.join(applied_leaderboard_groups)} + Base"
+        if applied_leaderboard_groups
+        else "Leaderboard tag filter: all"
+    )
 
     if leaderboard_df["quality_score_pct"].notna().any():
         leaderboard_df = leaderboard_df.sort_values(
@@ -3702,6 +3840,7 @@ def update_leaderboard_content(
         return (
             leaderboard_rows,
             leaderboard_styles,
+            leaderboard_filter_status,
             _empty_figure("No quality-score data for selected base-vs-policy pairs"),
             _empty_figure("No drop-in data for selected base-vs-policy pairs"),
             [],
@@ -3921,6 +4060,7 @@ def update_leaderboard_content(
     return (
         leaderboard_rows,
         leaderboard_styles,
+        leaderboard_filter_status,
         quality_violin_fig,
         dropin_violin_fig,
         significant_rows,
